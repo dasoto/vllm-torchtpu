@@ -89,6 +89,14 @@ class _TPUKimiK31Config(_TPUKimiK3Config):
                 "Kimi K3.1 sparse MLA requires an FP8 latent KV cache. "
                 "Pass --kv-cache-dtype fp8_e4m3."
             )
+        if vllm_config.cache_config.cache_dtype == "fp8":
+            from vllm.platforms import current_platform
+
+            if current_platform.fp8_dtype() != torch.float8_e4m3fn:
+                # Sparse MLA unpack_bkv bitcasts raw bytes as float8_e4m3fn on
+                # all TPU generations; keep PyTorch KV quantization on e4m3fn
+                # when TpuPlatform.fp8_dtype() defaults to e5m2 (TPU v6e).
+                vllm_config.cache_config.cache_dtype = "fp8_e4m3"
 
 
 class _TPUQwen2Config(VerifyAndUpdateConfig):

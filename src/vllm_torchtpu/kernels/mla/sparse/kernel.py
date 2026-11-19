@@ -505,6 +505,7 @@ def _attention_kernel(
 
     q_dtype = q_hbm_ref.dtype
     q_packing = get_dtype_packing(q_dtype)
+    upcast_kv_for_mxu = pltpu.get_tpu_info().generation < 7
     # Validate against the KV dtype.
     assert o_hbm_ref.dtype == q_dtype
 
@@ -766,6 +767,10 @@ def _attention_kernel(
         kv_len = get_kv_len()
         k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
         bkv = jnp.where(k_span < kv_len, bkv, 0)
+        if upcast_kv_for_mxu:
+            # TPU v6e (gen 6) MXU does not support float8_e4m3fn operands;
+            # widen in VPU while keeping 1-byte fp8_e4m3 HBM KV storage.
+            bkv = bkv.astype(jnp.bfloat16)
         return bkv
 
     def fixup_capped_overflow(bi_sem_idx, bo_sem_idx):
@@ -1208,9 +1213,16 @@ def sparse_ragged_paged_attention(
         rope_words = (
             128 // rope_tokens_per_row if 128 % rope_tokens_per_row == 0 else -1
         )
+        try:
+            sc_info = pltpu.get_tpu_info().sparse_core
+            sc_lanes = (
+                sc_info.num_lanes if sc_info is not None else native_sc_gather.NUM_LANES
+            )
+        except Exception:
+            sc_lanes = native_sc_gather.NUM_LANES
         if (
             rope_words <= 0
-            or rope_words % native_sc_gather.NUM_LANES != 0
+            or rope_words % sc_lanes != 0
             or native_sc_gather.ROPE_PACKING * rope_words > 128
         ):
             raise ValueError(

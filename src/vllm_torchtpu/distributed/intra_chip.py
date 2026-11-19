@@ -34,6 +34,7 @@ logger = init_logger(__name__)
 
 _group = None
 _initialized = False
+_subgroups: dict[int, object] = {}
 
 
 def _chip_rank_groups() -> list[list[int]] | None:
@@ -148,3 +149,95 @@ def get_intra_chip_group():
         groups,
     )
     return _group
+
+
+def _contiguous_tp_subgroup_ranks(subgroup_size: int) -> list[list[int]] | None:
+    """Partition world ranks into contiguous ``subgroup_size`` TP slices."""
+    if subgroup_size < 2:
+        return None
+
+    import torch.distributed as dist
+
+    if not (dist.is_available() and dist.is_initialized()):
+        return None
+
+    from vllm.distributed.parallel_state import get_tp_group, get_world_group
+
+    world = get_world_group()
+    tp = get_tp_group()
+    if tp.world_size < subgroup_size or tp.world_size % subgroup_size != 0:
+        logger.warning(
+            "TP world_size %d does not divide evenly into subgroups of %d.",
+            tp.world_size,
+            subgroup_size,
+        )
+        return None
+    if world.world_size % subgroup_size != 0:
+        logger.warning(
+            "World size %d is not a multiple of subgroup_size %d.",
+            world.world_size,
+            subgroup_size,
+        )
+        return None
+
+    tp_ranks = [int(r) for r in tp.ranks]
+    tp_start = tp_ranks[0]
+    if tp_start % subgroup_size != 0 or tp_ranks != list(
+        range(tp_start, tp_start + tp.world_size)
+    ):
+        logger.warning(
+            "TP group ranks %s are not a contiguous %d-aligned block; refusing "
+            "to build latent projection subgroups.",
+            tp_ranks,
+            subgroup_size,
+        )
+        return None
+
+    world_ranks = [int(r) for r in world.ranks]
+    if world_ranks != list(range(world.world_size)):
+        logger.warning(
+            "World ranks %s are not 0..%d; refusing to build subgroups.",
+            world_ranks,
+            world.world_size - 1,
+        )
+        return None
+
+    return [
+        list(range(start, start + subgroup_size))
+        for start in range(0, world.world_size, subgroup_size)
+    ]
+
+
+def get_tp_subgroup(subgroup_size: int):
+    """Contiguous ``GroupCoordinator`` of width ``subgroup_size`` inside TP."""
+    if subgroup_size in _subgroups:
+        return _subgroups[subgroup_size]
+
+    groups = _contiguous_tp_subgroup_ranks(subgroup_size)
+    if groups is None:
+        _subgroups[subgroup_size] = None
+        return None
+
+    import torch.distributed as dist
+    from vllm.distributed.parallel_state import (
+        get_world_group,
+        init_model_parallel_group,
+    )
+
+    world = get_world_group()
+    backend = dist.get_backend(world.device_group)
+    group = init_model_parallel_group(
+        groups,
+        world.local_rank,
+        backend,
+        group_name=f"tp_sub_{subgroup_size}",
+    )
+    _subgroups[subgroup_size] = group
+    logger.info(
+        "TP subgroup ready: %d group(s) x %d rank(s), this rank is %d/%d.",
+        len(groups),
+        subgroup_size,
+        group.rank_in_group,
+        group.world_size,
+    )
+    return group

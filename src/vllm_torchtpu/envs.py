@@ -117,6 +117,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
+    TPU_LATENT_PROJ_SUBGROUP_SIZE: int = 0
     TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_TOKEN_BUCKET_LINEAR: bool = False
@@ -581,9 +582,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable the blockwise Pallas quantized matmul kernel for dense linears.
     "ENABLE_QUANTIZED_MATMUL_KERNEL": env_bool("ENABLE_QUANTIZED_MATMUL_KERNEL"),
     # Runtime block size for dense linear weight requantization.
-    "REQUANTIZE_BLOCK_SIZE": lambda: int(block_size)
-    if (block_size := os.getenv("REQUANTIZE_BLOCK_SIZE")) is not None
-    else None,
+    "REQUANTIZE_BLOCK_SIZE": lambda: (
+        int(block_size)
+        if (block_size := os.getenv("REQUANTIZE_BLOCK_SIZE")) is not None
+        else None
+    ),
     # Runtime dtype for dense linear weight requantization.
     "REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(
         "REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"
@@ -610,9 +613,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MOE_FUSED_EP_ENABLE_W4A8 use the kernel's smallest supported block.
     # Selecting MOE_FUSED_EP_KERNEL_IMPL=adaptive also does this automatically.
     # Other MoE paths retain their default, including explicit requantization.
-    "MOE_REQUANTIZE_BLOCK_SIZE": lambda: int(block_size)
-    if (block_size := os.getenv("MOE_REQUANTIZE_BLOCK_SIZE")) is not None
-    else None,
+    "MOE_REQUANTIZE_BLOCK_SIZE": lambda: (
+        int(block_size)
+        if (block_size := os.getenv("MOE_REQUANTIZE_BLOCK_SIZE")) is not None
+        else None
+    ),
     # Float32 bytes one load-time MoE requantization chunk materializes on
     # the device. The quantized chunk, its scales and the formatting
     # temporaries come on top. A chunk always holds at least one expert.
@@ -841,9 +846,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_MLA_MASKED_DENSE_MAX_KV_LEN"
     ),
     # Most model length cap for TPU compile bucketing
-    "VLLM_TPU_MOST_MODEL_LEN": lambda: int(val)
-    if (val := os.getenv("VLLM_TPU_MOST_MODEL_LEN")) is not None
-    else None,
+    "VLLM_TPU_MOST_MODEL_LEN": lambda: (
+        int(val) if (val := os.getenv("VLLM_TPU_MOST_MODEL_LEN")) is not None else None
+    ),
     # Skip padded tokens from MoE, otherwise they will route like
     # real tokens and activate experts whose output is thrown away.
     "TPU_MOE_SKIP_PADDED_TOKENS": env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
@@ -923,6 +928,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # time at TP=32; halving the bytes each core reads costs two on-package
     # all-gathers per layer. Independent of TPU_MOE_HIERARCHICAL_EP.
     "TPU_LATENT_PROJ_INTRA_CHIP_TP": env_bool("TPU_LATENT_PROJ_INTRA_CHIP_TP"),
+    # Contiguous TP subgroup width for sharding Kimi K3's latent-MoE down/up
+    # projections on single-core TPUs (e.g. 4 for the 4 chips of a TPU v6e
+    # host), where get_intra_chip_group() is None. 0 disables the override.
+    "TPU_LATENT_PROJ_SUBGROUP_SIZE": env_nonnegative_int(
+        "TPU_LATENT_PROJ_SUBGROUP_SIZE", 0
+    ),
     # Experimental: shard DSv4 attention wq_b/wo_a/wo_b across a chip's two
     # cores while KV and attention stay DP (deepseek_v4/attn_intra_chip.py).
     "TPU_DSV4_ATTN_INTRA_CHIP_TP": env_bool("TPU_DSV4_ATTN_INTRA_CHIP_TP"),
@@ -1069,16 +1080,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 = the arithmetic device-order layout (the one every disaggregated
     # Raiden pair was verified with before #587; also the only option on a
     # torch_tpu older than 2026-08-13, which lacks the API).
-    "TPU_PCP_TOPOLOGY_AWARE_MESH": lambda: os.getenv("TPU_PCP_TOPOLOGY_AWARE_MESH", "1")
-    .strip()
-    .lower()
-    not in ("0", "false", "off", "no"),
+    "TPU_PCP_TOPOLOGY_AWARE_MESH": lambda: (
+        os.getenv("TPU_PCP_TOPOLOGY_AWARE_MESH", "1").strip().lower()
+        not in ("0", "false", "off", "no")
+    ),
     # Pipelined double-buffered DMA staging in ragged_kv_cache_update and fused
     # query DMA layout in RPA v3.
-    "USE_RPA_PIPELINED_DMA_STAGING": lambda: env_bool("USE_RPA_PIPELINED_DMA_STAGING")()
-    or env_bool("USE_PIPELINED_DMA_STAGING")(),
-    "USE_PIPELINED_DMA_STAGING": lambda: env_bool("USE_PIPELINED_DMA_STAGING")()
-    or env_bool("USE_RPA_PIPELINED_DMA_STAGING")(),
+    "USE_RPA_PIPELINED_DMA_STAGING": lambda: (
+        env_bool("USE_RPA_PIPELINED_DMA_STAGING")()
+        or env_bool("USE_PIPELINED_DMA_STAGING")()
+    ),
+    "USE_PIPELINED_DMA_STAGING": lambda: (
+        env_bool("USE_PIPELINED_DMA_STAGING")()
+        or env_bool("USE_RPA_PIPELINED_DMA_STAGING")()
+    ),
     # Enables the block-major KV cache layout for Raiden offloading. Bundles all
     # attention layer fragments into a single contiguous array in HBM, collapsing
     # per-block transfers from F independent DMAs into a single hardware DMA.

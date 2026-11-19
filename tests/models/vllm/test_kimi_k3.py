@@ -2784,6 +2784,42 @@ def test_kimi_k31_config_rejects_sp_prefill(monkeypatch) -> None:
         _TPUKimiK31Config.verify_and_update_config(_k31_vllm_config())
 
 
+def test_kimi_k31_config_normalizes_fp8_to_fp8_e4m3_on_v6e(monkeypatch) -> None:
+    monkeypatch.setattr(current_platform, "fp8_dtype", lambda: torch.float8_e5m2)
+    cfg = _k31_vllm_config(cache_dtype="fp8")
+    _TPUKimiK31Config.verify_and_update_config(cfg)
+    assert cfg.cache_config.cache_dtype == "fp8_e4m3"
+
+    cfg_explicit = _k31_vllm_config(cache_dtype="fp8_e4m3")
+    _TPUKimiK31Config.verify_and_update_config(cfg_explicit)
+    assert cfg_explicit.cache_config.cache_dtype == "fp8_e4m3"
+
+
+def test_sparse_mla_specs_support_both_sparsecore_and_tensorcore_layouts(
+    monkeypatch,
+) -> None:
+    from vllm_torchtpu.kernels.mla.kv_cache_utils import KVCacheLayout
+    from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackend
+
+    monkeypatch.setattr(envs, "TPU_SPARSE_MLA_NOPE_LAYOUT", "sparsecore")
+    monkeypatch.setattr(envs, "TPU_SPARSE_MLA_ROPE_LAYOUT", "sparsecore")
+    sc_nope, sc_rope = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+        4, 256, 576, torch.float8_e4m3fn
+    )
+    assert sc_nope.layout == KVCacheLayout.SPARSECORE
+    assert sc_nope.shape == (4, 256, 128)
+    assert sc_rope.shape == (4, 32, 128)
+
+    monkeypatch.setattr(envs, "TPU_SPARSE_MLA_NOPE_LAYOUT", "tensorcore")
+    monkeypatch.setattr(envs, "TPU_SPARSE_MLA_ROPE_LAYOUT", "tensorcore")
+    tc_nope, tc_rope = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+        4, 256, 576, torch.float8_e4m3fn
+    )
+    assert tc_nope.layout == KVCacheLayout.TENSORCORE
+    assert tc_nope.shape == (4, 256, 4, 128)
+    assert tc_rope.shape == (4, 64, 4, 128)
+
+
 class _RecordingIndexerOp(nn.Module):
     def __init__(self, *args) -> None:
         super().__init__()

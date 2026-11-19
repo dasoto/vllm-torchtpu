@@ -597,7 +597,11 @@ def _pooled_kda_core(
     # consecutive pool blocks — so measure the regions against the manager
     # block and let gather_region/scatter_region remap the ids
     # (`state_indices * split + kb`) through their split branch.
-    tokens_per_row = pool.shape[2] if pool.ndim > 3 else 1
+    tokens_per_row = (
+        1
+        if pool.shape[1] == pool_block_tokens
+        else (pool.shape[2] if pool.ndim > 3 else 1)
+    )
     if pool_block_tokens % tokens_per_row != 0:
         raise ValueError(
             "Manager block size is not a whole number of pool "

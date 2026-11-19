@@ -270,6 +270,7 @@ def test_declines_to_shard(monkeypatch, flag, group, output_size, why):
     from vllm_torchtpu import envs
     from vllm_torchtpu.layers.adapter import latent_proj_intra_chip as mod
 
+    monkeypatch.setattr(envs, "TPU_LATENT_PROJ_SUBGROUP_SIZE", 0)
     monkeypatch.setattr(envs, "TPU_LATENT_PROJ_INTRA_CHIP_TP", flag)
     monkeypatch.setattr(mod, "get_intra_chip_group", lambda: group)
     monkeypatch.setattr(mod, "_warned", False)
@@ -284,8 +285,89 @@ def test_shards_when_everything_lines_up(monkeypatch):
     from vllm_torchtpu.layers.adapter import latent_proj_intra_chip as mod
 
     group = _FakeGroup(2, rank_in_group=1)
+    monkeypatch.setattr(envs, "TPU_LATENT_PROJ_SUBGROUP_SIZE", 0)
     monkeypatch.setattr(envs, "TPU_LATENT_PROJ_INTRA_CHIP_TP", True)
     monkeypatch.setattr(mod, "get_intra_chip_group", lambda: group)
 
     assert mod.shard_group_or_none(3584) is group
     assert mod.shard_group_or_none(7168) is group
+
+
+# --------------------------------------------------------------------------
+# Contiguous TP subgroups for single-core TPUs (e.g. 4-chip TPU v6e hosts).
+# --------------------------------------------------------------------------
+
+
+class _FakeParallelGroup:
+    def __init__(self, ranks: list[int]) -> None:
+        self.ranks = ranks
+        self.world_size = len(ranks)
+
+
+@pytest.mark.parametrize("dp_rank", [0, 2])
+def test_contiguous_tp_subgroup_ranks_partitions_tp_and_dp(monkeypatch, dp_rank: int):
+    """On an 8x16 TPU v6e slice (world=128, TP=32, DP=4), subgroup_size=4
+    partitions all 128 ranks into 32 contiguous 4-chip host subgroups."""
+    import vllm.distributed.parallel_state as ps
+
+    from vllm_torchtpu.distributed import intra_chip
+
+    world = _FakeParallelGroup(list(range(128)))
+    tp_start = dp_rank * 32
+    tp = _FakeParallelGroup(list(range(tp_start, tp_start + 32)))
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(ps, "get_world_group", lambda: world)
+    monkeypatch.setattr(ps, "get_tp_group", lambda: tp)
+
+    groups = intra_chip._contiguous_tp_subgroup_ranks(4)
+
+    assert groups is not None
+    assert len(groups) == 32
+    assert all(len(g) == 4 for g in groups)
+    assert groups[0] == [0, 1, 2, 3]
+    assert groups[-1] == [124, 125, 126, 127]
+
+
+@pytest.mark.parametrize(
+    "subgroup_size,tp_ranks",
+    [
+        (1, list(range(8))),  # trivial subgroup
+        (4, list(range(6))),  # TP not divisible by subgroup_size
+        (4, [2, 3, 4, 5]),  # TP start not subgroup-aligned
+        (4, [0, 2, 4, 6]),  # non-contiguous TP ranks
+    ],
+)
+def test_contiguous_tp_subgroup_ranks_declines_invalid_layouts(
+    monkeypatch, subgroup_size: int, tp_ranks: list[int]
+):
+    import vllm.distributed.parallel_state as ps
+
+    from vllm_torchtpu.distributed import intra_chip
+
+    world = _FakeParallelGroup(list(range(16)))
+    tp = _FakeParallelGroup(tp_ranks)
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(ps, "get_world_group", lambda: world)
+    monkeypatch.setattr(ps, "get_tp_group", lambda: tp)
+
+    assert intra_chip._contiguous_tp_subgroup_ranks(subgroup_size) is None
+
+
+def test_shard_group_or_none_uses_tp_subgroup_on_single_core_tpu(monkeypatch):
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter import latent_proj_intra_chip as mod
+
+    subgroup = _FakeGroup(4, rank_in_group=3)
+    monkeypatch.setattr(envs, "TPU_LATENT_PROJ_SUBGROUP_SIZE", 4)
+    monkeypatch.setattr(envs, "TPU_LATENT_PROJ_INTRA_CHIP_TP", False)
+    monkeypatch.setattr(mod, "get_intra_chip_group", lambda: None)
+    monkeypatch.setattr(
+        mod, "get_tp_subgroup", lambda size: subgroup if size == 4 else None
+    )
+    monkeypatch.setattr(mod, "_warned", False)
+
+    assert mod.shard_group_or_none(3584) is subgroup
+    assert mod.shard_group_or_none(7168) is subgroup
+    assert mod.shard_group_or_none(3586) is None

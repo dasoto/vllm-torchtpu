@@ -89,34 +89,38 @@ def _kernel(
     live_hbm_ref: Any = None,
     guard_tail: bool = False,
     rope_words: int = ROPE_WORDS,
+    num_lanes: int = NUM_LANES,
 ):
+    quads_per_atom = num_lanes
+    occurrences_per_atom = quads_per_atom * ROPE_PACKING
     owner = lax.axis_index((core_axis_name, subcore_axis_name))
     live_batches = None
     if live_hbm_ref is not None:
-        # The live logical-batch count arrives as a broadcast i32[NUM_LANES]
+        # The live logical-batch count arrives as a broadcast i32[num_lanes]
         # vector. On SparseCore a scalar load is legal only from SMEM and SMEM
         # only at rank 0 (jax/_src/pallas/mosaic/sc_lowering.py), so the count is
         # DMA'd into a VMEM vector and lane 0 extracted -- the same shape as the
-        # in-repo dsa_gather.py:90 (`valid_ref[pl.ds(0, 16)][0]`).
+        # in-repo dsa_gather.py:90 (`valid_ref[pl.ds(0, num_lanes)][0]`).
         cp = pltpu.make_async_copy(live_hbm_ref, live_vmem_ref, live_sem_ref.at[0])
         cp.start()
         cp.wait()
-        # Lanes [0,16) broadcast the live logical-batch count, lanes [16,32)
-        # the per-owner trip count; only lane 0 of a vector is ever extracted.
-        live_batches = live_vmem_ref[pl.ds(0, NUM_LANES)][0]
+        # Lanes [0, num_lanes) broadcast the live logical-batch count, lanes
+        # [num_lanes, 2*num_lanes) the per-owner trip count; only lane 0 of a
+        # vector is ever extracted.
+        live_batches = live_vmem_ref[pl.ds(0, num_lanes)][0]
 
     def serve_batch(indices_ref):
         owner_batch = pl.program_id(0)
         logical_batch = owner + owner_batch * num_owners
-        occurrence_base = logical_batch * atoms_per_batch * OCCURRENCES_PER_ATOM
+        occurrence_base = logical_batch * atoms_per_batch * occurrences_per_atom
 
         def values(atom, stream):
             return indices_ref[0, atom, stream, :]
 
         def destinations(atom, stream):
             return pl.ds(
-                occurrence_base + atom * OCCURRENCES_PER_ATOM + stream * NUM_LANES,
-                NUM_LANES,
+                occurrence_base + atom * occurrences_per_atom + stream * num_lanes,
+                num_lanes,
             )
 
         def body(*refs):
@@ -138,12 +142,12 @@ def _kernel(
                 for copy in nope_copies:
                     copy.wait()
 
-            for row in range(QUADS_PER_ATOM):
+            for row in range(quads_per_atom):
                 data = []
                 for token_slot in range(ROPE_PACKING):
                     logical_rank = row * ROPE_PACKING + token_slot
-                    input_stream = logical_rank // NUM_LANES
-                    input_lane = logical_rank % NUM_LANES
+                    input_stream = logical_rank // num_lanes
+                    input_lane = logical_rank % num_lanes
                     data.append(
                         rope_inputs[input_stream][
                             pl.ds(input_lane, 1), pl.ds(0, rope_words)
@@ -171,20 +175,20 @@ def _kernel(
 
         nope_specs = tuple(
             pl.BlockSpec(
-                (pl.Indirect(NUM_LANES), 128),
+                (pl.Indirect(num_lanes), 128),
                 lambda atom, stream=stream: (values(atom, stream), 0),
             )
             for stream in range(ROPE_PACKING)
         )
         rope_specs = tuple(
             pl.BlockSpec(
-                (pl.Indirect(NUM_LANES), rope_words),
+                (pl.Indirect(num_lanes), rope_words),
                 lambda atom, stream=stream: (values(atom, stream), 0),
             )
             for stream in range(ROPE_PACKING)
         )
         rope_out_spec = pl.BlockSpec(
-            (QUADS_PER_ATOM, 128),
+            (quads_per_atom, 128),
             lambda atom: (logical_batch * atoms_per_batch + atom, 0),
         )
 
@@ -209,7 +213,7 @@ def _kernel(
             run_inner()
 
     indices_spec = pl.BlockSpec(
-        (1, atoms_per_batch, ROPE_PACKING, NUM_LANES),
+        (1, atoms_per_batch, ROPE_PACKING, num_lanes),
         lambda batch: (owner + batch * num_owners, 0, 0, 0),
     )
     if live_batches is None:
@@ -227,7 +231,7 @@ def _kernel(
         # @ce57049, is a TensorCore test. This SC form is measured in-repo.
         # Uniform per-owner trip count; no scalar division on SC: the wrapper
         # sends live_batches as a multiple-of-num_owners-rounded pair.
-        owner_batches = live_vmem_ref[pl.ds(NUM_LANES, NUM_LANES)][0]
+        owner_batches = live_vmem_ref[pl.ds(num_lanes, num_lanes)][0]
 
         @pl.when(owner_batches > 0)
         def _serve_live():
@@ -293,26 +297,28 @@ def dsa_gather_native_sc(
             f"ROPE cache ({rope_cache.size} words) must divide evenly across "
             f"NOPE tokens ({num_tokens})"
         )
+    tpu_info = pltpu.get_tpu_info()
+    sc_info = tpu_info.sparse_core if tpu_info is not None else None
+    num_cores = sc_info.num_cores if sc_info is not None else NUM_CORES
+    num_subcores = sc_info.num_subcores if sc_info is not None else NUM_SUBCORES
+    num_lanes = sc_info.num_lanes if sc_info is not None else NUM_LANES
+    occurrences_per_atom = num_lanes * ROPE_PACKING
+    num_owners = num_cores * num_subcores
+
     rope_words = rope_cache.size // num_tokens
     if (
         rope_words <= 0
-        or rope_words % NUM_LANES != 0
+        or rope_words % num_lanes != 0
         or ROPE_PACKING * rope_words > 128
         or 128 % rope_words != 0
     ):
         raise ValueError(
             f"derived rope_words ({rope_words}) must be a positive multiple of "
-            f"{NUM_LANES} dividing 128 with {ROPE_PACKING} * rope_words <= 128"
+            f"{num_lanes} dividing 128 with {ROPE_PACKING} * rope_words <= 128"
         )
     rope_rows_view = rope_cache.reshape(-1, rope_words)
 
-    tpu_info = pltpu.get_tpu_info()
-    sc_info = tpu_info.sparse_core if tpu_info is not None else None
-    num_cores = sc_info.num_cores if sc_info is not None else NUM_CORES
-    num_subcores = sc_info.num_subcores if sc_info is not None else NUM_SUBCORES
-    num_owners = num_cores * num_subcores
-
-    max_possible_atoms = out_size // (num_owners * OCCURRENCES_PER_ATOM)
+    max_possible_atoms = out_size // (num_owners * occurrences_per_atom)
     if atoms_per_batch > max_possible_atoms > 0:
         atoms_per_batch = max_possible_atoms
     if atoms_per_batch <= 0:
@@ -321,7 +327,7 @@ def dsa_gather_native_sc(
             f"(out_size={out_size}, num_owners={num_owners})"
         )
 
-    occurrences_per_batch = atoms_per_batch * OCCURRENCES_PER_ATOM
+    occurrences_per_batch = atoms_per_batch * occurrences_per_atom
     owner_batch_size = num_owners * occurrences_per_batch
     if out_size % owner_batch_size != 0:
         raise ValueError(
@@ -335,7 +341,7 @@ def dsa_gather_native_sc(
     operands = [
         nope_rows_view,
         rope_rows_view,
-        indices.reshape(num_batches, atoms_per_batch, ROPE_PACKING, NUM_LANES),
+        indices.reshape(num_batches, atoms_per_batch, ROPE_PACKING, num_lanes),
     ]
     guard_tail = False
     if live:
@@ -348,20 +354,21 @@ def dsa_gather_native_sc(
             num_batches,
         )
         owner_b = (live_b + num_owners - 1) // num_owners
-        # Lanes [0,16) = live logical batches, [16,32) = per-owner grid length.
+        # Lanes [0, num_lanes) = live logical batches,
+        # [num_lanes, 2*num_lanes) = per-owner grid length.
         live_vec = jnp.concatenate(
             [
-                jnp.full((NUM_LANES,), live_b, jnp.int32),
-                jnp.full((NUM_LANES,), owner_b, jnp.int32),
+                jnp.full((num_lanes,), live_b, jnp.int32),
+                jnp.full((num_lanes,), owner_b, jnp.int32),
             ]
         )
         operands.append(live_vec)
-        scratch_types["live_vmem_ref"] = pltpu.VMEM((2 * NUM_LANES,), jnp.int32)
+        scratch_types["live_vmem_ref"] = pltpu.VMEM((2 * num_lanes,), jnp.int32)
         scratch_types["live_sem_ref"] = pltpu.SemaphoreType.DMA((1,))
         # Per-owner guard is needed only if a live count can leave a ragged
         # last round, i.e. unless the caller promises num_live_indices is a
         # multiple of num_owners * occurrences_per_batch (at topk=2048,
-        # atoms=1: 32 * 64 = 2048 = one token, so decode needs no guard).
+        # atoms=1: 32 * 64 = 2048 = one token on v7x; 32 * 32 = 1024 on v6e).
         guard_tail = live_multiple % owner_batch_size != 0
     mesh = plsc.VectorSubcoreMesh(
         num_cores=num_cores,
@@ -380,6 +387,7 @@ def dsa_gather_native_sc(
         serve_pipelined=serve_pipelined,
         guard_tail=guard_tail,
         rope_words=rope_words,
+        num_lanes=num_lanes,
     )
     if live:
         inner = body

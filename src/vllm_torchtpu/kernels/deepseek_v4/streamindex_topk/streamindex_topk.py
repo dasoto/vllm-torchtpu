@@ -208,6 +208,7 @@ def kernel(
     scores_hbm_ref = score_refs[-1]
     buffer_cnt = buffer_count
     seq_along_lane = kv_layout == KVLayout.SEQ_ALONG_LANE
+    upcast_fp8_for_mxu = pltpu.get_tpu_info().generation < 7
 
     _, num_q_heads, head_dim = q_hbm_ref.shape
 
@@ -428,15 +429,19 @@ def kernel(
         w = bq_weights.astype(jnp.float32)
 
         def qk(rows):
+            lhs, rhs = rows, bkv
+            if upcast_fp8_for_mxu:
+                if lhs.dtype == jnp.float8_e4m3fn:
+                    lhs = lhs.astype(jnp.bfloat16)
+                if rhs.dtype == jnp.float8_e4m3fn:
+                    rhs = rhs.astype(jnp.bfloat16)
             if seq_along_lane:
                 # bkv is [head_dim, bkv_sz]: the MXU-native contraction layout.
                 return jnp.einsum(
-                    "nd,dm->nm", rows, bkv, preferred_element_type=jnp.float32
+                    "nd,dm->nm", lhs, rhs, preferred_element_type=jnp.float32
                 )
             # bkv is [bkv_sz, head_dim].
-            return jnp.einsum(
-                "nd,md->nm", rows, bkv, preferred_element_type=jnp.float32
-            )
+            return jnp.einsum("nd,md->nm", lhs, rhs, preferred_element_type=jnp.float32)
 
         if n_tok == 1:
             # Decode. With a single query token there is no token axis to trade
@@ -627,6 +632,11 @@ def kernel(
                 return keys, scales
 
             def qk(q_rows, keys):
+                if upcast_fp8_for_mxu:
+                    if q_rows.dtype == jnp.float8_e4m3fn:
+                        q_rows = q_rows.astype(jnp.bfloat16)
+                    if keys.dtype == jnp.float8_e4m3fn:
+                        keys = keys.astype(jnp.bfloat16)
                 # keys is [head_dim, lane_chunk]: the MXU-native contraction layout.
                 return jnp.einsum(
                     "nd,dm->nm", q_rows, keys, preferred_element_type=jnp.float32
@@ -645,6 +655,11 @@ def kernel(
                 return keys, scales
 
             def qk(q_rows, keys):
+                if upcast_fp8_for_mxu:
+                    if q_rows.dtype == jnp.float8_e4m3fn:
+                        q_rows = q_rows.astype(jnp.bfloat16)
+                    if keys.dtype == jnp.float8_e4m3fn:
+                        keys = keys.astype(jnp.bfloat16)
                 # keys is [lane_chunk, head_dim].
                 return jnp.einsum(
                     "nd,md->nm", q_rows, keys, preferred_element_type=jnp.float32

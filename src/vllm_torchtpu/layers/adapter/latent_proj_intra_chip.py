@@ -39,7 +39,7 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLi
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.distributed.intra_chip import get_intra_chip_group
+from vllm_torchtpu.distributed.intra_chip import get_intra_chip_group, get_tp_subgroup
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -108,24 +108,34 @@ class IntraChipColumnParallelLinear(ColumnParallelLinear):
 
 
 def shard_group_or_none(output_size: int):
-    """The chip group to shard ``output_size`` across, or ``None`` to replicate.
+    """The chip/subgroup to shard ``output_size`` across, or ``None`` to replicate.
 
     Separated from layer construction so the decision -- the part with all the
     ways to be wrong -- can be tested without an initialized TP group.
 
-    Answers ``None`` for every reason the split might not hold: the flag is
-    off, the chip topology is unreadable, there is one core per chip, or the
-    output does not divide evenly across the cores.
+    Answers ``None`` for every reason the split might not hold: both flags are
+    off, the chip topology or TP subgroup is unusable, there is one rank per
+    group, or the output does not divide evenly across the group.
     """
-    if not envs.TPU_LATENT_PROJ_INTRA_CHIP_TP:
-        return None
-
-    group = get_intra_chip_group()
-    if group is None or group.world_size < 2:
-        _warn_once(
-            "TPU_LATENT_PROJ_INTRA_CHIP_TP is set but there is no usable "
-            "intra-chip group; leaving the latent projections replicated."
-        )
+    subgroup_size = envs.TPU_LATENT_PROJ_SUBGROUP_SIZE
+    if subgroup_size >= 2:
+        group = get_tp_subgroup(subgroup_size)
+        if group is None or group.world_size < 2:
+            _warn_once(
+                "TPU_LATENT_PROJ_SUBGROUP_SIZE=%d is set but there is no "
+                "usable TP subgroup; leaving the latent projections replicated.",
+                subgroup_size,
+            )
+            return None
+    elif envs.TPU_LATENT_PROJ_INTRA_CHIP_TP:
+        group = get_intra_chip_group()
+        if group is None or group.world_size < 2:
+            _warn_once(
+                "TPU_LATENT_PROJ_INTRA_CHIP_TP is set but there is no usable "
+                "intra-chip group; leaving the latent projections replicated."
+            )
+            return None
+    else:
         return None
 
     if output_size % group.world_size != 0:
