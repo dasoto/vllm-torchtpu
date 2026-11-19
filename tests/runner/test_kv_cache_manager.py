@@ -265,6 +265,7 @@ def _spec_runner(unified: bool):
     runner.shared_kv_cache_layers = {}
     runner.runner_only_attn_layers = set()
     runner.speculative_config = None
+    runner.pcp_manager = None
     runner.kv_cache_manager = KVCacheManager(runner)
     runner.get_kv_cache_spec = TPUModelRunner.get_kv_cache_spec.__get__(runner)
     return runner

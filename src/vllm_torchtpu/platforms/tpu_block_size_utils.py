@@ -79,8 +79,11 @@ def folded_dsa_indexer_caches(
     group. Empty for attention-only models and the per-layer layout, where the
     indexer cache stays a layer of its own.
     """
+    model_config = getattr(vllm_config, "model_config", None)
     if not (
-        vllm_config.model_config.is_hybrid and unified_kv_layout_enabled(vllm_config)
+        model_config is not None
+        and model_config.is_hybrid
+        and unified_kv_layout_enabled(vllm_config)
     ):
         return {}
     from vllm.config import get_layers_from_vllm_config
