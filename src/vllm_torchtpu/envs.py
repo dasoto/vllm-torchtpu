@@ -220,6 +220,8 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    VLLM_TPU_PREFILL_CADENCE_NO_ESCAPE: bool = False
+    VLLM_TPU_SRPT_PROMOTE_WARM_WAITING: bool = False
     VLLM_TPU_MEGAKERNEL: str = ""
     VLLM_TPU_EXPERIMENTAL_USE_RUST: bool = False
     VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY: str = ""
@@ -1357,6 +1359,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tile).
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
+    ),
+    # SrptPrefillScheduler: keep prefill_schedule_interval active even when
+    # requests wait in the queue, and hold prefill on ranks without local
+    # decodes while another EP-lockstep DP rank is decoding.
+    "VLLM_TPU_PREFILL_CADENCE_NO_ESCAPE": env_bool(
+        "VLLM_TPU_PREFILL_CADENCE_NO_ESCAPE", default=False
+    ),
+    # SrptPrefillScheduler: promote warm prefix-cached multi-turn requests in
+    # the waiting queue ahead of cold uncached prompts (with age anti-starvation).
+    "VLLM_TPU_SRPT_PROMOTE_WARM_WAITING": env_bool(
+        "VLLM_TPU_SRPT_PROMOTE_WARM_WAITING", default=False
     ),
     # Enable and configure the fused Pallas megakernel ("1"/"true" for defaults,
     # "ep"/"tp" for mode, or "mode=tp,buckets=8:16:32,verify_buckets=4:8:16,ab=1").

@@ -681,3 +681,92 @@ def test_attn_work_cap_holds_chunk_with_most_attention_work(shared_model_config)
     scheduler._other_rank_decoding = True
     scheduler.add_request(_make_real_request("wait", 64, hasher, seed=3))
     assert scheduler.schedule().num_scheduled_tokens == {"fresh": 64, "wait": 64}
+
+
+def test_cadence_no_escape_keeps_defer_prefills_with_waiting_backlog(
+    shared_model_config,
+):
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        num_blocks=128,
+        max_num_seqs=8,
+        max_num_batched_tokens=64,
+    )
+    scheduler.cadence_no_escape = True
+    # Admit `dec` (16 tokens) so it becomes a decode request on step 2.
+    scheduler.add_request(_make_real_request("dec", 16, hasher, seed=1))
+    assert scheduler.schedule(throttle_prefills=False).num_scheduled_tokens == {
+        "dec": 16
+    }
+    # Add two long prefills (`p1` and `p2`, 128 tokens each). Release step fills
+    # the 64-token budget (`dec`: 1 + `p1`: 63) and leaves `p2` in `waiting`.
+    scheduler.add_request(_make_real_request("p1", 128, hasher, seed=2))
+    scheduler.add_request(_make_real_request("p2", 128, hasher, seed=3))
+    out_release = scheduler.schedule(throttle_prefills=False)
+    assert out_release.num_scheduled_tokens == {"dec": 1, "p1": 63}
+    assert scheduler.prefill_capacity_bound is False
+    # Next step has `throttle_prefills=True`: with `cadence_no_escape`, neither
+    # `p1` (in-progress prefill chunk) nor `p2` (waiting) runs; only `dec` runs.
+    out_throttled = scheduler.schedule(throttle_prefills=True)
+    assert out_throttled.num_scheduled_tokens == {"dec": 1}
+
+
+def test_cadence_no_escape_holds_prefills_when_other_rank_decoding(
+    shared_model_config, monkeypatch
+):
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        num_blocks=128,
+        max_num_seqs=8,
+        max_num_batched_tokens=64,
+    )
+    scheduler.cadence_no_escape = True
+    monkeypatch.setattr(AsyncScheduler, "update_from_output", lambda *args: {})
+    scheduler.add_request(_make_real_request("p1", 128, hasher, seed=10))
+    scheduler.add_request(_make_real_request("p2", 128, hasher, seed=11))
+    # Step 1 (release): `p1` runs 64 tokens (`p1` still prefilling, `p2` waiting,
+    # 0 local decode requests).
+    assert scheduler.schedule(throttle_prefills=False).num_scheduled_tokens == {
+        "p1": 64
+    }
+    # When another DP rank is decoding on a throttled step, hold `p1` and pause `p2`.
+    scheduler.update_from_output(None, SimpleNamespace(other_rank_decoding=True))
+    assert scheduler.schedule(throttle_prefills=True).num_scheduled_tokens == {}
+    # When NO DP rank is decoding, full prefill runs unthrottled.
+    scheduler.update_from_output(None, SimpleNamespace(other_rank_decoding=False))
+    assert scheduler.schedule(throttle_prefills=True).num_scheduled_tokens == {
+        "p1": 64
+    }
+
+
+def test_promote_warm_waiting_prioritizes_prefix_hit(shared_model_config):
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        num_blocks=128,
+        max_num_seqs=8,
+        max_num_batched_tokens=64,
+    )
+    scheduler.promote_warm_waiting = True
+    # Populate prefix cache with a 48-token conversation prefix (seed=99).
+    seed_req = _make_real_request("seed_turn", 48, hasher, seed=99)
+    scheduler.add_request(seed_req)
+    assert scheduler.schedule().num_scheduled_tokens == {"seed_turn": 48}
+    scheduler.schedule()
+    scheduler.finish_requests("seed_turn", RequestStatus.FINISHED_ABORTED)
+    scheduler.schedule()
+
+    # Enqueue a cold 64-token Turn-0 request first, followed by a warm 64-token
+    # follow-up turn sharing the 48-token cached prefix (`16` uncached tokens).
+    cold_req = _make_real_request("cold_t0", 64, hasher, seed=55)
+    warm_req = _make_real_request(
+        "warm_t1",
+        64,
+        hasher,
+        seed=100,
+        shared_prefix=list(seed_req.prompt_token_ids),
+    )
+    scheduler.add_request(cold_req)
+    scheduler.add_request(warm_req)
+    out = scheduler.schedule()
+    assert list(out.num_scheduled_tokens.keys())[0] == "warm_t1"
+    assert out.num_scheduled_tokens["warm_t1"] == 16

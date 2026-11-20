@@ -67,12 +67,15 @@ Select with ``--scheduler-cls``
 """
 
 import math
-from itertools import chain
+import time
+from itertools import chain, islice
+from typing import cast
 
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.core.sched.request_queue import SchedulingPolicy
+from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -84,6 +87,8 @@ logger = init_logger(__name__)
 
 _MAX_BACKOFF_SHIFT = 6
 _ATTN_CAP_LOG_EVERY = 10000
+_WARM_WINDOW = 64
+_WARM_STARVATION_SECONDS = 90.0
 
 
 class SrptPrefillScheduler(AsyncScheduler):
@@ -100,6 +105,8 @@ class SrptPrefillScheduler(AsyncScheduler):
         self._hold_backoff: dict[str, tuple[int, int]] = {}
         self.attn_work_cap = envs.VLLM_TPU_SRPT_ATTN_WORK_CAP
         self.attn_tile_tokens = max(envs.VLLM_TPU_SRPT_ATTN_TILE_TOKENS, 1)
+        self.cadence_no_escape = envs.VLLM_TPU_PREFILL_CADENCE_NO_ESCAPE
+        self.promote_warm_waiting = envs.VLLM_TPU_SRPT_PROMOTE_WARM_WAITING
         # Whether another DP rank decoded in the last step the runner reported,
         # and whether the cap applies to the step being scheduled.
         self._other_rank_decoding = False
@@ -115,23 +122,79 @@ class SrptPrefillScheduler(AsyncScheduler):
         self._attn_capped_chunks = 0
         logger.info(
             "SrptPrefillScheduler active (max_consecutive_holds=%d, "
-            "attn_work_cap=%d, attn_tile_tokens=%d)",
+            "attn_work_cap=%d, attn_tile_tokens=%d, cadence_no_escape=%s, "
+            "promote_warm_waiting=%s)",
             self.max_consecutive_holds,
             self.attn_work_cap,
             self.attn_tile_tokens,
+            self.cadence_no_escape,
+            self.promote_warm_waiting,
         )
 
+    def _maybe_promote_warm_waiting(self) -> None:
+        """Promote ready request with fewest uncached prompt tokens in WINDOW."""
+        if (
+            not self.promote_warm_waiting
+            or self.policy != SchedulingPolicy.FCFS
+            or len(self.waiting) < 2
+        ):
+            return
+        ready = [
+            r
+            for r in islice(self.waiting, _WARM_WINDOW)
+            if not self._is_blocked_waiting_status(r.status)
+        ]
+        if len(ready) < 2:
+            return
+        now = time.time()
+
+        def rank_key(req: Request) -> tuple[int, int, float]:
+            _, hit = self._prefix_hit(req)
+            uncached = max(req.num_tokens - hit, 0)
+            urgent = (
+                req.num_preemptions > 0
+                or uncached <= 8192
+                or (now - req.arrival_time) > _WARM_STARVATION_SECONDS
+            )
+            return (0 if urgent else 1, uncached, req.arrival_time)
+
+        head_req = ready[0]
+        head_key = rank_key(head_req)
+        best_req = min(ready, key=rank_key)
+        if best_req is not head_req and rank_key(best_req) < head_key:
+            cast(FCFSRequestQueue, self.waiting).remove(best_req)
+            self.waiting.prepend_request(best_req)
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        local_decoding = any(not r.is_prefill_chunk for r in self.running)
         # The cap only protects decodes: it applies while this rank decodes in
         # this step or another rank decoded in the last reported step.
         self._attn_cap_on = bool(self.attn_work_cap) and (
-            self._other_rank_decoding
-            or any(not r.is_prefill_chunk for r in self.running)
+            self._other_rank_decoding or local_decoding
         )
+        if self.cadence_no_escape:
+            self.prefill_capacity_bound = False
+        self._maybe_promote_warm_waiting()
+
         held: list[Request] = []
         target = None
         prefilling: list[Request] = []
-        if not throttle_prefills and self.policy == SchedulingPolicy.FCFS:
+        prev_pause_state = self._pause_state
+        prev_max_scheduled = self.max_num_scheduled_tokens
+        cross_rank_decode_hold = (
+            throttle_prefills
+            and self.cadence_no_escape
+            and not local_decoding
+            and self._other_rank_decoding
+        )
+        if cross_rank_decode_hold:
+            held = [r for r in self.running if r.is_prefill_chunk]
+            if prev_pause_state == PauseState.UNPAUSED:
+                self._pause_state = PauseState.PAUSED_NEW
+            self.max_num_scheduled_tokens = min(
+                prev_max_scheduled, self.scheduler_config.max_num_seqs
+            )
+        elif not throttle_prefills and self.policy == SchedulingPolicy.FCFS:
             self._prune_hold_state()
             self._order_running()
             prefilling = [r for r in self.running if r.is_prefill_chunk]
@@ -147,8 +210,12 @@ class SrptPrefillScheduler(AsyncScheduler):
         self._in_schedule = True
         try:
             output = super().schedule(throttle_prefills)
+            if self.cadence_no_escape:
+                self.prefill_capacity_bound = False
         finally:
             self._in_schedule = False
+            self._pause_state = prev_pause_state
+            self.max_num_scheduled_tokens = prev_max_scheduled
             self.max_num_running_reqs += len(held)
             self.max_num_active_reqs += len(held)
             self.running.extend(held)

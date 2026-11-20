@@ -14,6 +14,7 @@
 # Imported for their registration side effects; the out-of-tree
 # RowParallelLinear in `linear` only affects layers built after the import, so
 # this module must be imported before any model is constructed.
+from vllm_torchtpu.core.dp_prefix_routing import patch_dp_prefix_routing
 from vllm_torchtpu.layers.adapter import attention as attention
 from vllm_torchtpu.layers.adapter import linear as linear
 from vllm_torchtpu.models.vllm import register_models
@@ -23,3 +24,6 @@ from vllm_torchtpu.tokenizers import register_tokenizers
 def register_layers() -> None:
     register_models()
     register_tokenizers()
+    # vLLM's spawned APIServer process invokes general plugins without
+    # activating TpuPlatform, so install DPLBAsyncMPClient prefix routing here.
+    patch_dp_prefix_routing()
