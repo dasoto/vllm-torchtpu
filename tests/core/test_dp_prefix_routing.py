@@ -133,6 +133,33 @@ class TestDPPrefixDirectory(unittest.TestCase):
         )
         self.assertEqual(eng, 3)
 
+    def test_12k_warm_multiturn_sticks_on_dp8_and_dp16(self):
+        for dp_size in (8, 16):
+            directory = _DPPrefixDirectory(num_engines=dp_size, chunk_tokens=512)
+            prompt = [3000 + i for i in range(12_288)]
+            _, digests = directory.select_engine(
+                prompt_token_ids=prompt,
+                lb_engines=[(0, 0, 0.0)] * dp_size,
+                inflight_by_idx=[0] * dp_size,
+                client_count=1,
+                eng_start_index=0,
+            )
+            home = dp_size - 1
+            directory.record(digests, home)
+
+            lb = [(0, 0, 0.2)] * dp_size
+            lb[home] = (6, 12, 0.65)
+            inflight = [0] * dp_size
+            inflight[home] = 18
+            eng, _ = directory.select_engine(
+                prompt_token_ids=prompt + [88] * 2_560,
+                lb_engines=lb,
+                inflight_by_idx=inflight,
+                client_count=1,
+                eng_start_index=0,
+            )
+            self.assertEqual(eng, home)
+
     def test_patch_dp_prefix_routing_respects_explicit_rank(self):
         class FakeClient:
             def __init__(self):

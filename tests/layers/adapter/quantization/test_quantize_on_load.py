@@ -163,3 +163,29 @@ class TestUnquantizedConfigQuantizeOnLoadDispatch:
                 moe_layer, prefix="model.layers.0.mlp.experts"
             )
         assert isinstance(method, VllmUnquantizedFusedMoEMethod)
+
+    def test_in_graph_fp8_linear_apply_matches_dequant_matmul(
+        self, monkeypatch, linear_layer
+    ):
+        monkeypatch.setenv("QUANTIZE_ON_LOAD_PREFIXES", "self_attn")
+        monkeypatch.setenv("TPU_FP8_LINEAR_IN_GRAPH", "1")
+        cfg = VllmUnquantizedConfig()
+        method = cfg.get_quant_method(
+            linear_layer, prefix="model.layers.0.self_attn.q_proj"
+        )
+        assert isinstance(method, VllmFp8LinearMethodTPU)
+        torch.manual_seed(0)
+        w_bf16 = torch.randn(32, 64, dtype=torch.bfloat16) * 0.1
+        linear_layer.register_parameter(
+            "weight", torch.nn.Parameter(w_bf16.clone(), requires_grad=False)
+        )
+        method.process_weights_after_loading(linear_layer)
+        x = torch.randn(8, 64, dtype=torch.bfloat16)
+        out = method.apply(linear_layer, x)
+        ref = torch.matmul(x, w_bf16.t())
+        cos = torch.nn.functional.cosine_similarity(
+            out.float().flatten(), ref.float().flatten(), dim=0
+        )
+        assert out.shape == (8, 32)
+        assert out.dtype == torch.bfloat16
+        assert float(cos) > 0.998

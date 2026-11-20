@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
+    TPU_FP8_LINEAR_IN_GRAPH: bool = False
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_MOE_REQUANT_CHUNK_BYTES: int = 1 << 30
@@ -608,6 +609,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_FP8_LINEAR_W8A16_MAX_ROWS": env_nonnegative_int(
         "TPU_FP8_LINEAR_W8A16_MAX_ROWS", 0
     ),
+    # Execute per-channel FP8 dense linears directly in the Torch/XLA graph as
+    # `torch.matmul(x, weight.to(x.dtype)) * weight_scale.to(x.dtype)`, avoiding
+    # per-layer `pallas.jax_op` custom-call barriers and layout copies.
+    "TPU_FP8_LINEAR_IN_GRAPH": env_bool("TPU_FP8_LINEAR_IN_GRAPH"),
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(
         "MOE_REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"

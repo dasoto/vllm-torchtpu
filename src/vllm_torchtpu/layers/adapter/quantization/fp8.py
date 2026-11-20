@@ -1685,8 +1685,11 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             # Stored [n_out, n_in] for a raw consumer; `quantized_matmul`
             # takes the canonical (k, n), so flip the view for the contraction.
             weight = weight.transpose(0, 1)
-        if isinstance(layer, VocabParallelEmbedding):
-            # Prevent the quantization of activations to FP8 (W8A16).
+        if isinstance(layer, VocabParallelEmbedding) or (
+            envs.TPU_FP8_LINEAR_IN_GRAPH and layer.weight_scale.ndim == 1
+        ):
+            # Keep the contraction in-graph (W8A16) so XLA fuses the FP8->BF16
+            # cast into the HBM load stream and overlaps TP collectives.
             out = torch.matmul(x, weight.to(x.dtype)) * layer.weight_scale.to(x.dtype)
         else:
             out = quantized_matmul(

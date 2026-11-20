@@ -787,3 +787,21 @@ def test_promote_warm_waiting_bypasses_stalled_kv_fetch(shared_model_config):
     scheduler._kv_fetch_stages = {stalled_req: "waiting_to_start"}
     scheduler._maybe_promote_warm_waiting()
     assert list(scheduler.waiting)[0].request_id == "cold_ready"
+
+
+def test_tpu_runner_any_decode_enabled_by_cadence_no_escape(monkeypatch):
+    import numpy as np
+
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    monkeypatch.setenv("VLLM_TPU_SRPT_ATTN_WORK_CAP", "0")
+    monkeypatch.setenv("VLLM_TPU_PREFILL_CADENCE_NO_ESCAPE", "1")
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner.input_batch = SimpleNamespace(
+        req_id_to_index={"dec_r": 0, "pref_r": 1},
+        num_computed_tokens_cpu=np.array([64, 32], dtype=np.int32),
+        num_prompt_tokens=np.array([64, 128], dtype=np.int32),
+    )
+    assert not runner._any_decode(SimpleNamespace(num_scheduled_tokens={}))
+    assert not runner._any_decode(SimpleNamespace(num_scheduled_tokens={"pref_r": 32}))
+    assert runner._any_decode(SimpleNamespace(num_scheduled_tokens={"dec_r": 1}))

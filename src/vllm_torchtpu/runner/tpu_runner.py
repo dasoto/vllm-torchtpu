@@ -4230,8 +4230,13 @@ class TPUModelRunner(GPUModelRunner):
 
     def _any_decode(self, scheduler_output: "SchedulerOutput") -> bool:
         """Whether this step schedules a request past its prompt; computed
-        only for the SRPT attention work cap, which reads it."""
-        if not envs.VLLM_TPU_SRPT_ATTN_WORK_CAP:
+        for SRPT attention work cap and cross-rank decode cadence hold."""
+        if not (
+            envs.VLLM_TPU_SRPT_ATTN_WORK_CAP
+            or envs.VLLM_TPU_PREFILL_CADENCE_NO_ESCAPE
+        ):
+            return False
+        if not scheduler_output.num_scheduled_tokens:
             return False
         batch = self.input_batch
         indices = [
