@@ -770,3 +770,20 @@ def test_promote_warm_waiting_prioritizes_prefix_hit(shared_model_config):
     out = scheduler.schedule()
     assert list(out.num_scheduled_tokens.keys())[0] == "warm_t1"
     assert out.num_scheduled_tokens["warm_t1"] == 16
+
+
+def test_promote_warm_waiting_bypasses_stalled_kv_fetch(shared_model_config):
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        num_blocks=128,
+        max_num_seqs=8,
+        max_num_batched_tokens=64,
+    )
+    scheduler.promote_warm_waiting = True
+    stalled_req = _make_real_request("stalled_fetch", 64, hasher, seed=201)
+    cold_req = _make_real_request("cold_ready", 64, hasher, seed=202)
+    scheduler.add_request(stalled_req)
+    scheduler.add_request(cold_req)
+    scheduler._kv_fetch_stages = {stalled_req: "waiting_to_start"}
+    scheduler._maybe_promote_warm_waiting()
+    assert list(scheduler.waiting)[0].request_id == "cold_ready"

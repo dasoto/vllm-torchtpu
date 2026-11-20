@@ -48,6 +48,8 @@ _MAX_TRACKED_CHUNKS = 262_144
 _RUNNING_TOKEN_WEIGHT = 512.0
 _WAITING_TOKEN_WEIGHT = 4096.0
 _STORAGE_BALANCE_WEIGHT = 6144.0
+_STICKY_LONG_PREFIX_TOKENS = 16_384
+_WARM_FOLLOWUP_MAX_UNCACHED = 24_576
 
 
 def _rolling_chunk_digests(
@@ -148,6 +150,12 @@ class _DPPrefixDirectory:
         digests = _rolling_chunk_digests(prompt_token_ids, self.chunk_tokens)
         cached = self.cached_tokens_by_engine(digests)
         prompt_len = len(prompt_token_ids)
+        max_cached = max(cached) if cached else 0
+        long_warm_session = (
+            max_cached >= _STICKY_LONG_PREFIX_TOKENS
+            and (prompt_len - max_cached) <= _WARM_FOLLOWUP_MAX_UNCACHED
+        )
+        uncached_scale = float(max(self.num_engines, 1)) if long_warm_session else 1.0
         avg_blocks = max(sum(self._engine_counts) / max(self.num_engines, 1), 1.0)
 
         best_idx = eng_start_index % self.num_engines
@@ -160,12 +168,21 @@ class _DPPrefixDirectory:
             local_inflight = client_count * inflight_by_idx[idx]
             unreported = max(0, local_inflight - (waiting + running))
             eff_waiting = float(waiting + unreported)
+            if (
+                long_warm_session
+                and cached[idx] >= _STICKY_LONG_PREFIX_TOKENS
+                and (prompt_len - cached[idx]) <= _WARM_FOLLOWUP_MAX_UNCACHED
+            ):
+                # Warm long-context follow-ups are promoted ahead of cold waiting
+                # prefills by SrptPrefillScheduler; do not spill them to a cold
+                # DP engine where recomputing 50K-180K tokens stalls all EP ranks.
+                eff_waiting = min(eff_waiting, 1.0)
             eff_running = float(running)
             load_cost = (
                 eff_running * _RUNNING_TOKEN_WEIGHT
                 + eff_waiting * _WAITING_TOKEN_WEIGHT * (1.0 + 2.0 * kv_usage)
             )
-            uncached = float(max(0, prompt_len - cached[idx]))
+            uncached = float(max(0, prompt_len - cached[idx])) * uncached_scale
             storage_ratio = self._engine_counts[idx] / avg_blocks
             cost = (
                 load_cost

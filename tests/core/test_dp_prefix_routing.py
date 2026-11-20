@@ -105,6 +105,34 @@ class TestDPPrefixDirectory(unittest.TestCase):
         )
         self.assertNotEqual(eng, 0)
 
+    def test_long_warm_multiturn_sticks_under_queue_load(self):
+        directory = _DPPrefixDirectory(num_engines=8, chunk_tokens=512)
+        prompt = [2000 + i for i in range(55_296)]
+        _, digests = directory.select_engine(
+            prompt_token_ids=prompt,
+            lb_engines=[(0, 0, 0.0)] * 8,
+            inflight_by_idx=[0] * 8,
+            client_count=1,
+            eng_start_index=0,
+        )
+        directory.record(digests, 3)
+
+        # Engine 3 owns the 55K conversation prefix and has 8 waiting + 12 running,
+        # while other DP engines are idle. Under EP lockstep + warm waiting
+        # promotion, Turn 1 (+512 tokens) must stick to Engine 3.
+        lb = [(0, 0, 0.1)] * 8
+        lb[3] = (8, 12, 0.85)
+        inflight = [0] * 8
+        inflight[3] = 20
+        eng, _ = directory.select_engine(
+            prompt_token_ids=prompt + [77] * 512,
+            lb_engines=lb,
+            inflight_by_idx=inflight,
+            client_count=1,
+            eng_start_index=0,
+        )
+        self.assertEqual(eng, 3)
+
     def test_patch_dp_prefix_routing_respects_explicit_rank(self):
         class FakeClient:
             def __init__(self):

@@ -77,6 +77,7 @@ from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
 from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.metrics.stats import KV_FETCH_WAITING_TO_START
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 
@@ -147,16 +148,27 @@ class SrptPrefillScheduler(AsyncScheduler):
         if len(ready) < 2:
             return
         now = time.time()
+        kv_fetch_stages = getattr(self, "_kv_fetch_stages", None) or {}
+        has_inflight_prefills = bool(getattr(self, "_inflight_prefills", None))
 
-        def rank_key(req: Request) -> tuple[int, int, float]:
+        def rank_key(req: Request) -> tuple[int, int, int, float]:
             _, hit = self._prefix_hit(req)
             uncached = max(req.num_tokens - hit, 0)
-            urgent = (
+            is_stalled_fetch = kv_fetch_stages.get(req) == KV_FETCH_WAITING_TO_START
+            urgent = not is_stalled_fetch and (
                 req.num_preemptions > 0
                 or uncached <= 8192
                 or (now - req.arrival_time) > _WARM_STARVATION_SECONDS
             )
-            return (0 if urgent else 1, uncached, req.arrival_time)
+            # Always let urgent local-HBM hits jump ahead of a stalled async
+            # fetch. Only let cold long prefills jump ahead of a stalled async
+            # fetch when no in-flight prefill is currently running (otherwise
+            # admitting another cold long prefill inflates `_inflight_prefills`
+            # reservations and further delays the warm external KV load).
+            demote_stalled_cold = (
+                1 if (is_stalled_fetch and not has_inflight_prefills) else 0
+            )
+            return (0 if urgent else 1, demote_stalled_cold, uncached, req.arrival_time)
 
         head_req = ready[0]
         head_key = rank_key(head_req)
