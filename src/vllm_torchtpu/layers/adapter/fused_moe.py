@@ -26,9 +26,11 @@ import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     quantize_to_native_fp4_kmajor,
+    requant_pack_int32_kmajor,
     requant_unpack_kmajor,
     resolve_onehot_permute_threshold,
     unpack_fp4_to_e2m1,
+    unpack_fp4_to_packed_int32_kmajor,
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.moe_reference_parity import (
@@ -42,7 +44,9 @@ logger = init_logger(__name__)
 _kernel_instance_counter = 0
 _fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool, bool], Callable] = {}
 _load_kmajor_fp4_op = None
+_load_kmajor_fp4_int32_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
+_requant_kmajor_fp4_int32_ops: dict[int, Callable] = {}
 _quantize_native_fp4_kmajor_ops: dict[tuple[int, bool], Callable] = {}
 
 
@@ -152,6 +156,22 @@ def load_kmajor_fp4(w_u8: torch.Tensor) -> torch.Tensor:
     return _load_kmajor_fp4_op(w_u8)
 
 
+def load_kmajor_fp4_int32(w_u8: torch.Tensor) -> torch.Tensor:
+    """One-time load transform for TPU < v7: packed uint8 ``[..., N, K//2]`` ->
+    packed K-major ``torch.int32`` ``[..., K//8, N]`` (8 E2M1 nibbles per int32).
+
+    Storing ``int32`` ``T(8, 128)`` in HBM matches ``gmm_v2``'s ``uint4``
+    ``T(64, 128)(8, 1)E(4)`` Pallas block layout via zero-cost ``memref_bitcast``,
+    eliminating the per-step full-weight HBM relayout copy on TPU < v7.
+    """
+    global _load_kmajor_fp4_int32_op
+    if _load_kmajor_fp4_int32_op is None:
+        _load_kmajor_fp4_int32_op = pallas.jax_op(
+            "pallas::nvfp4_load_kmajor_i32", unpack_fp4_to_packed_int32_kmajor
+        )
+    return _load_kmajor_fp4_int32_op(w_u8)
+
+
 def requant_load_kmajor_fp4(
     w_u8: torch.Tensor, scale_f: torch.Tensor, block: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -169,6 +189,20 @@ def requant_load_kmajor_fp4(
             functools.partial(requant_unpack_kmajor, block=block),
         )
         _requant_kmajor_fp4_ops[block] = op
+    return op(w_u8, scale_f)
+
+
+def requant_load_kmajor_fp4_int32(
+    w_u8: torch.Tensor, scale_f: torch.Tensor, block: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """W4A8 requant + K-major int32 packing for TPU < v7."""
+    op = _requant_kmajor_fp4_int32_ops.get(block)
+    if op is None:
+        op = pallas.jax_op(
+            f"pallas::nvfp4_requant_kmajor_i32_b{block}",
+            functools.partial(requant_pack_int32_kmajor, block=block),
+        )
+        _requant_kmajor_fp4_int32_ops[block] = op
     return op(w_u8, scale_f)
 
 

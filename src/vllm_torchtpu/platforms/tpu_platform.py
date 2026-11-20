@@ -516,6 +516,17 @@ class TpuPlatform(Platform):
         "TPU_SPARSE_MLA_NOPE_LAYOUT",
         "TPU_SPARSE_MLA_ROPE_LAYOUT",
         "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL",
+        "TPU_DP_PREFIX_ROUTING",
+        "TPU_MXFP4_MOE_PACKED_INT32",
+        "TPU_DCP_MLA_TOPK_CAP",
+        "TPU_DCP_MLA_TOPK_CAP_CHUNK",
+        "TPU_MLA_SPARSE_SPLIT_Q",
+        "TPU_DCP_LSE_MERGE_A2A",
+        "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS",
+        "TPU_STREAMIDX_SMALL_BUCKET_BQ",
+        "TPU_STREAMIDX_SMALL_BUCKET_BKVP",
+        "TPU_STREAMIDX_SMALL_BUCKET_TOKENS",
+        "TPU_STREAMIDX_CHUNK_TOKENS",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import

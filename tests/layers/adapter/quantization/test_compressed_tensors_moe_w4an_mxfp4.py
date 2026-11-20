@@ -129,10 +129,16 @@ def test_mxfp4_create_weights_and_process():
             layer.w2_weight_scale, w2_scale_val, "w2_weight_scale", "", expert_id
         )
 
-    # 2. process_weights_after_loading
-    with patch(
-        "vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.prebuild_fused_moe_kernel"
-    ) as mock_prebuild:
+    # 2. process_weights_after_loading (unpacked float4_e2m1fn_x2 path)
+    with (
+        patch(
+            "vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.envs.TPU_MXFP4_MOE_PACKED_INT32",
+            False,
+        ),
+        patch(
+            "vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.prebuild_fused_moe_kernel"
+        ) as mock_prebuild,
+    ):
         method.process_weights_after_loading(layer)
     mock_prebuild.assert_called_once_with(
         topk_weights_float32=False,
@@ -587,6 +593,10 @@ def test_mxfp4_requantize_block():
 
     with (
         patch(
+            "vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.envs.TPU_MXFP4_MOE_PACKED_INT32",
+            False,
+        ),
+        patch(
             "vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4.envs.MOE_REQUANTIZE_BLOCK_SIZE",
             "64",
         ),
@@ -653,7 +663,7 @@ def test_preselected_routes_keep_padding_and_skip_router(monkeypatch):
     monkeypatch.setattr(
         module.moe_routing,
         "route",
-        lambda *args, **kwargs: (calls.append("router") or (weights, ids)),
+        lambda *args, **kwargs: calls.append("router") or (weights, ids),
     )
 
     def mask(ids, weights, is_local_tensor):
@@ -676,3 +686,46 @@ def test_preselected_routes_keep_padding_and_skip_router(monkeypatch):
     torch.testing.assert_close(selected["topk_weights"], regular["topk_weights"])
     torch.testing.assert_close(selected["topk_ids"], regular["topk_ids"])
     assert selected["topk_weights"][-1].count_nonzero() == 0
+
+
+def test_pack_kmajor_fp4_to_int32_roundtrip_bit_exact():
+    import jax
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.kernels.megablox.gmm_v2 import _decode_e2m1_u4
+    from vllm_torchtpu.layers.core.fused_moe_gmm import (
+        pack_kmajor_fp4_to_int32,
+        unpack_fp4_to_packed_int32_kmajor,
+    )
+
+    with jax.default_device(jax.devices("cpu")[0]):
+        # [E=2, N=4, K//2=8] -> K=16
+        raw_u8 = jnp.arange(2 * 4 * 8, dtype=jnp.uint8).reshape(2, 4, 8)
+        packed_i32 = unpack_fp4_to_packed_int32_kmajor(raw_u8)
+        assert packed_i32.shape == (2, 2, 4)
+        assert packed_i32.dtype == jnp.int32
+
+        # Unpack int32 -> uint4 [2, 2, 4, 8] -> K-major [2, 16, 4]
+        u4 = jnp.swapaxes(
+            jax.lax.bitcast_convert_type(packed_i32, jnp.uint4), -1, -2
+        ).reshape(2, 16, 4)
+        decoded = _decode_e2m1_u4(u4, jnp.float32)
+
+        fp4_ref = jnp.swapaxes(
+            jax.lax.bitcast_convert_type(raw_u8, jnp.float4_e2m1fn).reshape(2, 4, 16),
+            -1,
+            -2,
+        ).astype(jnp.float32)
+        assert jnp.array_equal(decoded, fp4_ref)
+        assert jnp.array_equal(
+            pack_kmajor_fp4_to_int32(
+                jnp.swapaxes(
+                    jax.lax.bitcast_convert_type(raw_u8, jnp.float4_e2m1fn).reshape(
+                        2, 4, 16
+                    ),
+                    -1,
+                    -2,
+                )
+            ),
+            packed_i32,
+        )

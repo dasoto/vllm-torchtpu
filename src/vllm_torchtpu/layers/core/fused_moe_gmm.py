@@ -197,6 +197,39 @@ def quantize_to_native_fp4_kmajor(
     return packed, scale
 
 
+def pack_kmajor_fp4_to_int32(fp4_kmajor: jax.Array) -> jax.Array:
+    """Pack K-major ``float4_e2m1fn`` ``[..., K, N]`` (``K % 8 == 0``) into
+    ``int32`` ``[..., K // 8, N]`` (8 E2M1 nibbles per int32, LSB-first along K).
+
+    On TPU < v7, storing ``int32`` ``T(8, 128)`` in HBM allows ``gmm_v2``'s
+    ``rhs_ref.weight.bitcast(jnp.uint4)`` to view ``u4`` ``T(64, 128)(8, 1)E(4)``
+    in place inside Pallas without a per-step full-weight HBM relayout copy.
+    """
+    size_k = fp4_kmajor.shape[-2]
+    if size_k % 8 != 0:
+        raise ValueError(
+            f"pack_kmajor_fp4_to_int32 requires K divisible by 8, got {size_k}"
+        )
+    octets = fp4_kmajor.reshape(
+        *fp4_kmajor.shape[:-2], size_k // 8, 8, fp4_kmajor.shape[-1]
+    )
+    octets = jnp.swapaxes(octets, -1, -2)  # [..., K // 8, N, 8]
+    return jax.lax.bitcast_convert_type(octets, jnp.int32)
+
+
+def unpack_fp4_to_packed_int32_kmajor(w_packed: jax.Array) -> jax.Array:
+    """Unpack ``[..., N, K/2]`` uint8 E2M1 into K-major ``[..., K/8, N]`` int32."""
+    return pack_kmajor_fp4_to_int32(unpack_fp4_to_e2m1(w_packed))
+
+
+def requant_pack_int32_kmajor(
+    w_packed: jax.Array, scale_f: jax.Array, block: int
+) -> tuple[jax.Array, jax.Array]:
+    """Requantize MXFP4/NVFP4 weight to ``block`` and pack K-major into int32."""
+    kmajor_fp4, scale = requant_unpack_kmajor(w_packed, scale_f, block)
+    return pack_kmajor_fp4_to_int32(kmajor_fp4), scale
+
+
 def gmm_wrapper(
     lhs,
     rhs,
@@ -212,9 +245,10 @@ def gmm_wrapper(
     # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
     # fp4 accuracy (error compounds across MoE layers) with no decode speedup
     # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
+    effective_rhs_dtype = rhs_quant_dtype if rhs_quant_dtype is not None else rhs.dtype
     is_fp4_weight = (
-        jnp.issubdtype(rhs.dtype, jnp.floating)
-        and jax.dtypes.itemsize_bits(rhs.dtype) == 4
+        jnp.issubdtype(effective_rhs_dtype, jnp.floating)
+        and jax.dtypes.itemsize_bits(effective_rhs_dtype) == 4
     )
     return gmm_v2(
         lhs=lhs,

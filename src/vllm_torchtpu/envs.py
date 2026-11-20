@@ -90,6 +90,8 @@ if TYPE_CHECKING:
     TPU_KERNEL_RELOAD_MODULES: str = ""
     TPU_GREEDY_TOP_TOKENS: bool = False
     TPU_DP_VOCAB_PARALLEL: bool = False
+    TPU_DP_PREFIX_ROUTING: bool = True
+    TPU_MXFP4_MOE_PACKED_INT32: bool = True
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
@@ -817,6 +819,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # or multimodal models, or TPU_GREEDY_TOP_TOKENS. See
     # layers/adapter/dp_vocab_parallel.py.
     "TPU_DP_VOCAB_PARALLEL": env_bool("TPU_DP_VOCAB_PARALLEL"),
+    # Cache-aware prefix + load routing in DPLBAsyncMPClient when DP > 1 and
+    # prefix caching is enabled (core/dp_prefix_routing.py).
+    "TPU_DP_PREFIX_ROUTING": env_bool("TPU_DP_PREFIX_ROUTING", default=True),
+    # Pack K-major MXFP4 MoE weights into int32 [E, K//8, N] on TPU < v7 so
+    # gmm_v2 views uint4 via zero-cost memref_bitcast instead of per-step HBM relayout.
+    "TPU_MXFP4_MOE_PACKED_INT32": env_bool("TPU_MXFP4_MOE_PACKED_INT32", default=True),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
     # Tile size for MLA transpose pipeline.

@@ -13,8 +13,9 @@
 # limitations under the License.
 import math
 import zlib
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
+import jax.numpy as jnp
 import torch
 from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.fused_moe import RoutedExperts
@@ -28,8 +29,10 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     fused_moe_gmm,
     load_kmajor_fp4,
+    load_kmajor_fp4_int32,
     prebuild_fused_moe_kernel,
     requant_load_kmajor_fp4,
+    requant_load_kmajor_fp4_int32,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
@@ -46,6 +49,18 @@ if TYPE_CHECKING:
     from vllm_torchtpu.layers.adapter.quantization.configs import TpuRoutedExperts
 
 
+def _should_pack_fp4_as_int32(hidden: int, inter: int) -> bool:
+    """Use int32 K-major carrier on TPU < v7 so gmm_v2 views uint4 in-place."""
+    if not envs.TPU_MXFP4_MOE_PACKED_INT32 or hidden % 8 != 0 or inter % 8 != 0:
+        return False
+    try:
+        from jax.experimental.pallas import tpu as pltpu
+
+        return pltpu.get_tpu_info().generation < 7
+    except Exception:
+        return False
+
+
 class VllmCompressedTensorsW4ANMxfp4MoEMethod(
     TpuMoEActivationMixin, CompressedTensorsW4A4Mxfp4MoEMethod
 ):
@@ -53,6 +68,8 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
     TPU compressed-tensors packed-weight W4AN MXFP4 MoE implementation.
     Accommodates both W4A4 and W4A16.
     """
+
+    _rhs_quant_dtype: Any = None
 
     @property
     def is_monolithic(self) -> bool:
@@ -187,13 +204,18 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         w13_scale = e8m0_to_fp32_bits(w13_weight_scale)
         w2_scale = e8m0_to_fp32_bits(w2_weight_scale)
 
+        # The last dim of packed weights is K/2. So K is shape[-1] * 2.
+        hidden = w13_weight_packed.shape[-1] * 2
+        inter = w2_weight_packed.shape[-1] * 2
+        pack_int32 = (
+            w13_weight_packed.device.type == "tpu"
+            and _should_pack_fp4_as_int32(hidden, inter)
+        )
+        self._rhs_quant_dtype = jnp.float4_e2m1fn if pack_int32 else None
+
         requant_block = envs.MOE_REQUANTIZE_BLOCK_SIZE
         if requant_block is not None:
             requant_block = int(requant_block)
-
-            # The last dim of packed weights is K/2. So K is shape[-1] * 2.
-            hidden = w13_weight_packed.shape[-1] * 2
-            inter = w2_weight_packed.shape[-1] * 2
             if hidden % requant_block != 0 or inter % requant_block != 0:
                 raise ValueError(
                     f"W4A8 requantization needs hidden ({hidden}) and inter ({inter}) "
@@ -201,11 +223,14 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
                     "Padding is not yet supported."
                 )
 
+            requant_fn = (
+                requant_load_kmajor_fp4_int32 if pack_int32 else requant_load_kmajor_fp4
+            )
             # Apply XLA fused requantization and kmajor layout shift
-            w13_weight, w13_scale_4d = requant_load_kmajor_fp4(
+            w13_weight, w13_scale_4d = requant_fn(
                 fresh_buffer(w13_weight_packed), w13_scale, requant_block
             )
-            w2_weight, w2_scale_4d = requant_load_kmajor_fp4(
+            w2_weight, w2_scale_4d = requant_fn(
                 fresh_buffer(w2_weight_packed), w2_scale, requant_block
             )
         else:
@@ -218,10 +243,10 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             w13_scale_4d = _to_kernel_scale(w13_scale)
             w2_scale_4d = _to_kernel_scale(w2_scale)
 
-            # Unpack to native fp4 in the kernel's K-major layout once at load
-            # [E, N, K/2] uint8 -> [E, K/2, N] torch.float4_e2m1fn_x2
-            w13_weight = load_kmajor_fp4(fresh_buffer(w13_weight_packed))
-            w2_weight = load_kmajor_fp4(fresh_buffer(w2_weight_packed))
+            load_fn = load_kmajor_fp4_int32 if pack_int32 else load_kmajor_fp4
+            # Unpack to native fp4 (or int32 on TPU < v7) in K-major layout at load
+            w13_weight = load_fn(fresh_buffer(w13_weight_packed))
+            w2_weight = load_fn(fresh_buffer(w2_weight_packed))
 
         # Clean up CPU scratchpads
         for parameter in (
@@ -265,13 +290,16 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         if use_ep:
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
-        prebuild_fused_moe_kernel(
-            topk_weights_float32=self._tpu_topk_weights_float32,
-            topk=layer.moe_config.experts_per_token,
-            activation=activation_str,
-            use_ep=use_ep,
-            skip_padded_tokens=True,
-        )
+        prebuild_kwargs: dict[str, Any] = {
+            "topk_weights_float32": self._tpu_topk_weights_float32,
+            "topk": layer.moe_config.experts_per_token,
+            "activation": activation_str,
+            "use_ep": use_ep,
+            "skip_padded_tokens": True,
+        }
+        if self._rhs_quant_dtype is not None:
+            prebuild_kwargs["rhs_quant_dtype"] = self._rhs_quant_dtype
+        prebuild_fused_moe_kernel(**prebuild_kwargs)
 
     def apply_monolithic(
         self,
@@ -341,7 +369,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             "experts_start": layer._experts_start,
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
-            "rhs_quant_dtype": None,
+            "rhs_quant_dtype": self._rhs_quant_dtype,
             "skip_padded_tokens": True,
         }
         if pipelined:

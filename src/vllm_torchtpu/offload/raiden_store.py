@@ -218,10 +218,17 @@ def has_multi_shapes_kv_caches(vllm_config: VllmConfig) -> bool:
     """Whether this model's KV cache consists of multiple tensors
     of different shapes.
     """
-    return vllm_config.model_config.architecture in (
+    arch = vllm_config.model_config.architecture
+    if arch in (
         "DeepseekV4ForCausalLM",
         "GlmMoeDsaForCausalLM",
-    )
+        "KimiK31ForConditionalGeneration",
+    ):
+        return True
+    if arch in ("KimiLinearForCausalLM", "KimiK3ForConditionalGeneration"):
+        hf_text = getattr(vllm_config.model_config, "hf_text_config", None)
+        return getattr(hf_text, "dsa_config", None) is not None
+    return False
 
 
 class RaidenLoadStoreSpec(LoadStoreSpec):
@@ -1549,14 +1556,22 @@ def is_multi_shapes_geometry(per_block_shape: object) -> bool:
 def _resolve_multi_shapes_kv_geometry(
     kv_cache_config: KVCacheConfig,
 ) -> tuple[int, set[tuple[int, ...]], set[object], int]:
-    from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
+    from vllm.v1.kv_cache_interface import (
+        MambaSpec,
+        MLAAttentionSpec,
+        SlidingWindowMLASpec,
+    )
 
     groups = kv_cache_config.kv_cache_groups
+    mamba_leaves: list[MambaSpec] = []
     for group in groups:
         for leaf in iter_leaf_kv_cache_specs(group.kv_cache_spec):
+            if isinstance(leaf, MambaSpec):
+                mamba_leaves.append(leaf)
+                continue
             assert isinstance(leaf, (MLAAttentionSpec, SlidingWindowMLASpec)), (
                 "TPURaidenOffloadingConnector: an aliased KV "
-                "layout has only MLA-family layers; got "
+                "layout has only MLA-family (or hybrid Mamba+MLA) layers; got "
                 f"{type(leaf).__name__}"
             )
 
@@ -1571,13 +1586,20 @@ def _resolve_multi_shapes_kv_geometry(
     assert len(anchor_block_sizes) == 1
     block_size = anchor_block_sizes[0]
 
-    # One entry per full-attention MLA cache.
+    # One entry per full-attention MLA cache (plus hybrid Mamba state if present).
     per_block_shapes: set[tuple[int, ...]] = set()
     kv_dtypes: set[object] = set()
     for leaf in mla_leaves:
         shape = (leaf.num_states, leaf.num_kv_heads, leaf.head_size)
         per_block_shapes.add(shape)
         kv_dtypes.add(leaf.dtype)
+    for mamba_leaf in mamba_leaves:
+        assert mamba_leaf.block_size == block_size, (
+            "TPURaidenOffloadingConnector: hybrid multi-shape Mamba "
+            f"block_size={mamba_leaf.block_size} != MLA block_size={block_size}"
+        )
+        per_block_shapes.add((0, 1, mamba_leaf.page_size_bytes))
+        kv_dtypes.update(mamba_leaf.dtypes)
     return block_size, per_block_shapes, kv_dtypes, block_size
 
 

@@ -2928,6 +2928,45 @@ class TestHybridGeometry(unittest.TestCase):
         self.assertEqual(shape, (256, 8, 2, 128))
         selector.assert_called_once()
 
+    def test_kimi_k31_hybrid_dsa_multi_shape_geometry(self):
+        from vllm.v1.kv_cache_interface import MambaSpec, MLAAttentionSpec
+
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        mamba = MagicMock(spec=MambaSpec)
+        mamba.block_size = 512
+        mamba.page_size_bytes = 362496
+        mamba.dtypes = ("torch.float32", "torch.float32")
+
+        mla = MagicMock(spec=MLAAttentionSpec)
+        mla.block_size = 512
+        mla.num_states = 1
+        mla.num_kv_heads = 1
+        mla.head_size = 576
+        mla.dtype = "torch.float8_e4m3fn"
+
+        kv_cache_config = SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=mamba),
+                SimpleNamespace(kv_cache_spec=mla),
+            ]
+        )
+        vllm_cfg = SimpleNamespace(
+            model_config=SimpleNamespace(
+                architecture="KimiLinearForCausalLM",
+                hf_text_config=SimpleNamespace(dsa_config={"dsa_layers": [4]}),
+            )
+        )
+        self.assertTrue(rs.has_multi_shapes_kv_caches(vllm_cfg))
+        kernel, shapes, dtypes, device_block = rs.resolve_kernel_geometry(
+            vllm_cfg, kv_cache_config
+        )
+        self.assertEqual((kernel, device_block), (512, 512))
+        self.assertIn((1, 1, 576), shapes)
+        self.assertIn((0, 1, 362496), shapes)
+        self.assertIn("torch.float8_e4m3fn", dtypes)
+        self.assertIn("torch.float32", dtypes)
+
 
 class TestRaidenStoreWorkerStub(unittest.TestCase):
     def test_submit_paths_fail_loudly(self):

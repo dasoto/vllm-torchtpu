@@ -152,6 +152,7 @@ PATCHES = (
         "vllm_torchtpu.platforms.tpu_platform:_patch_api_server_kernel_reload_endpoint",
         _ACTIVE,
     ),
+    Patch("vllm_torchtpu.core.dp_prefix_routing:patch_dp_prefix_routing", _ACTIVE),
     # Model-specific patches.
     # Append patches for new models here with
     # stages=("platform_activation", "model_load") and model_config=True.
