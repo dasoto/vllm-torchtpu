@@ -28,6 +28,7 @@ import pytest
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     TileSizes,
+    _decode_e2m1_u4,
     apply_act_fn,
     gmm_v2,
     interleave_lane,
@@ -86,6 +87,21 @@ def test_apply_act_fn_dispatches_situ(monkeypatch, linear_beta):
 
     actual = apply_act_fn(interleave_lane(gate, up), f"situ:4.0:{linear_beta}")
     _assert_allclose(actual, expected)
+
+
+@pytest.mark.parametrize("target_dtype", [jnp.float32, jnp.bfloat16])
+def test_decode_e2m1_u4_bit_exact_all_nibbles(target_dtype):
+    raw_bytes = jnp.arange(256, dtype=jnp.uint8)
+    fp4_ref = jax.lax.bitcast_convert_type(raw_bytes, jnp.float4_e2m1fn)
+    u4 = jax.lax.bitcast_convert_type(fp4_ref, jnp.uint4)
+
+    got = _decode_e2m1_u4(u4, target_dtype)
+    expected = fp4_ref.astype(target_dtype)
+    bit_dtype = jnp.uint32 if target_dtype == jnp.float32 else jnp.uint16
+    np.testing.assert_array_equal(
+        np.asarray(jax.lax.bitcast_convert_type(got, bit_dtype)),
+        np.asarray(jax.lax.bitcast_convert_type(expected, bit_dtype)),
+    )
 
 
 def test_apply_act_fn_silu_bf16_rounds_intermediates_to_bfloat16(monkeypatch):

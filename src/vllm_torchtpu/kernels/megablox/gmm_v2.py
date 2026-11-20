@@ -73,6 +73,29 @@ def situ_and_mul(
     return gate * up
 
 
+def _decode_e2m1_u4(u4_val: jax.Array, target_dtype: jnp.dtype) -> jax.Array:
+    """Bit-exact VPU decode of 4-bit E2M1 nibbles (carried as uint4) to float.
+
+    TPU generations < 7 (e.g. Trillium / v6e) do not support hardware
+    `tpu.unpack_subelements` on `f4E2M1FN` (`SupportsFloat8EXMY() == false`),
+    whereas `uint4 -> uint32` unpacking uses standard integer B4 unpack.
+    For `mag = nibble & 7` in `2..7`, the IEEE-754 float32 bit patterns form an
+    exact arithmetic progression `0x3F000000 + (mag << 22)`; `mag == 1` is the
+    subnormal `+0.5` (`0x3F000000`) and `mag == 0` is `±0.0` (`0x00000000`).
+    """
+    nibble = u4_val.astype(jnp.uint32)
+    sign = (nibble & jnp.uint32(8)) << jnp.uint32(28)
+    mag = nibble & jnp.uint32(7)
+    exp_mant = jnp.where(
+        mag == jnp.uint32(1),
+        jnp.uint32(0x3F000000),
+        jnp.uint32(0x3F000000) + (mag << jnp.uint32(22)),
+    )
+    exp_mant = jnp.where(mag == jnp.uint32(0), jnp.uint32(0), exp_mant)
+    f32 = lax.bitcast_convert_type(sign | exp_mant, jnp.float32)
+    return f32.astype(target_dtype)
+
+
 def interleave_lane(lhs: jax.Array, rhs: jax.Array) -> jax.Array:
     """Interleaves two arrays along lane dim at zero-cost."""
     assert lhs.shape == rhs.shape
@@ -466,22 +489,52 @@ def inner_kernel(
         # contracting dimmensions
         rhs_tile_n = tiled_rhs.shape[1]
         rhs_qbs = cfgs.rhs_cfgs.quant_block_size
-        if cfgs.rhs_cfgs.should_dequantize_before_matmul:
-            tiled_rhs_scale = tiled_rhs_ref.get_scale(replicate_size=rhs_qbs).astype(
-                cfgs.lhs_cfgs.dtype
-            )
-            num_blocks = cfgs.num_quant_blocks_per_tile_k
-            tiled_rhs_dequant = tiled_rhs.astype(cfgs.lhs_cfgs.dtype).reshape(
-                num_blocks, rhs_qbs, rhs_tile_n
-            )
-            tiled_rhs_dequant = tiled_rhs_dequant * tiled_rhs_scale
-            tiled_rhs = tiled_rhs_dequant.reshape(cfgs.tiles.tile_k, rhs_tile_n)
-            rhs_qbs = cfgs.tiles.tile_k
-
         valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
-        if is_last_k_step and valid_k != 0:
-            mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 0) < valid_k
-            tiled_rhs = jnp.where(mask_rhs, tiled_rhs, 0)
+        is_emulated_e2m1 = (
+            tpu_info.generation < 7
+            and tiled_rhs.dtype == jnp.uint4
+            and (
+                cfgs.rhs_cfgs.quant_dtype == jnp.float4_e2m1fn
+                or cfgs.rhs_cfgs.dtype == jnp.float4_e2m1fn
+            )
+        )
+        if not is_emulated_e2m1:
+            if cfgs.rhs_cfgs.should_dequantize_before_matmul:
+                tiled_rhs_scale = tiled_rhs_ref.get_scale(
+                    replicate_size=rhs_qbs
+                ).astype(cfgs.lhs_cfgs.dtype)
+                num_blocks = cfgs.num_quant_blocks_per_tile_k
+                tiled_rhs_dequant = tiled_rhs.astype(cfgs.lhs_cfgs.dtype).reshape(
+                    num_blocks, rhs_qbs, rhs_tile_n
+                )
+                tiled_rhs_dequant = tiled_rhs_dequant * tiled_rhs_scale
+                tiled_rhs = tiled_rhs_dequant.reshape(cfgs.tiles.tile_k, rhs_tile_n)
+                rhs_qbs = cfgs.tiles.tile_k
+
+            if is_last_k_step and valid_k != 0:
+                mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 0) < valid_k
+                tiled_rhs = jnp.where(mask_rhs, tiled_rhs, 0)
+
+        def _prepare_emulated_e2m1_strip(
+            start_n: int, end_n: int, col_size: int
+        ) -> tuple[jax.Array, int]:
+            strip_rhs = _decode_e2m1_u4(
+                tiled_rhs[:, start_n:end_n], cfgs.lhs_cfgs.dtype
+            )
+            eff_qbs = rhs_qbs
+            if cfgs.rhs_cfgs.should_dequantize_before_matmul:
+                strip_scale = tiled_rhs_ref.get_scale(replicate_size=rhs_qbs)[
+                    :, :, start_n:end_n
+                ].astype(cfgs.lhs_cfgs.dtype)
+                num_blocks = cfgs.num_quant_blocks_per_tile_k
+                strip_rhs = (
+                    strip_rhs.reshape(num_blocks, rhs_qbs, col_size) * strip_scale
+                ).reshape(cfgs.tiles.tile_k, col_size)
+                eff_qbs = cfgs.tiles.tile_k
+            if is_last_k_step and valid_k != 0:
+                mask_rhs = lax.broadcasted_iota(jnp.int32, strip_rhs.shape, 0) < valid_k
+                strip_rhs = jnp.where(mask_rhs, strip_rhs, 0)
+            return strip_rhs, eff_qbs
 
         # Step 2: Matmul.
         acc_list = []
@@ -490,19 +543,26 @@ def inner_kernel(
             for start_n in range(0, rhs_tile_n, mxu_size):
                 end_n = min(rhs_tile_n, start_n + mxu_size)
                 col_size = end_n - start_n
+                if is_emulated_e2m1:
+                    strip_rhs_full, step_rhs_qbs = _prepare_emulated_e2m1_strip(
+                        start_n, end_n, col_size
+                    )
+                else:
+                    strip_rhs_full = tiled_rhs[:, start_n:end_n]
+                    step_rhs_qbs = rhs_qbs
 
                 acc_n = jnp.zeros((bucket_m, col_size), dtype=acc_ref.dtype)
-                for start_k in range(0, cfgs.tiles.tile_k, rhs_qbs):
-                    end_k = min(cfgs.tiles.tile_k, start_k + rhs_qbs)
+                for start_k in range(0, cfgs.tiles.tile_k, step_rhs_qbs):
+                    end_k = min(cfgs.tiles.tile_k, start_k + step_rhs_qbs)
 
                     block_acc = jnp.matmul(
                         tiled_lhs[:, start_k:end_k],
-                        tiled_rhs[start_k:end_k, start_n:end_n],
+                        strip_rhs_full[start_k:end_k, :],
                         preferred_element_type=jnp.float32,
                     ).astype(acc_ref.dtype)
 
                     if cfgs.rhs_cfgs.should_dequantize_after_matmul:
-                        b_id = start_k // rhs_qbs
+                        b_id = start_k // step_rhs_qbs
                         rhs_scale_replicated = tiled_rhs_ref.get_scale(
                             replicate_size=bucket_m
                         )[b_id, :, start_n : start_n + col_size]
@@ -531,13 +591,20 @@ def inner_kernel(
             for start_n in range(0, rhs_tile_n, mxu_size):
                 end_n = min(rhs_tile_n, start_n + mxu_size)
                 col_size = end_n - start_n
+                if is_emulated_e2m1:
+                    strip_rhs_full, step_rhs_qbs = _prepare_emulated_e2m1_strip(
+                        start_n, end_n, col_size
+                    )
+                else:
+                    strip_rhs_full = tiled_rhs[:, start_n:end_n]
+                    step_rhs_qbs = rhs_qbs
 
                 acc_n = jnp.zeros((bucket_m, col_size), dtype=acc_ref.dtype)
                 for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
                     end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
 
                     block_lhs = tiled_lhs[:, start_k:end_k]
-                    block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
+                    block_rhs = strip_rhs_full[start_k:end_k, :]
 
                     # Perform lhs quantization. Note that for every block_lhs,
                     # same computation will be performed tiles_n//mxu_size times.
@@ -568,7 +635,7 @@ def inner_kernel(
 
                     # Apply rhs subchannel scale per quant block.
                     if cfgs.rhs_cfgs.should_dequantize_after_matmul:
-                        b_id = start_k // rhs_qbs
+                        b_id = start_k // step_rhs_qbs
                         rhs_scale_replicated = tiled_rhs_ref.get_scale(
                             replicate_size=bucket_m
                         )[b_id, :, start_n : start_n + col_size]
@@ -885,7 +952,15 @@ def kernel_main(
     num_n = pl.cdiv(cfgs.out_size_n, cfgs.tiles.tile_n)
 
     if cfgs.rhs_cfgs.should_unpack:
-        rhs_weight = rhs_ref.weight.bitcast(cfgs.rhs_cfgs.quant_dtype)
+        unpack_dtype = (
+            jnp.uint4
+            if (
+                cfgs.rhs_cfgs.quant_dtype == jnp.float4_e2m1fn
+                and pltpu.get_tpu_info().generation < 7
+            )
+            else cfgs.rhs_cfgs.quant_dtype
+        )
+        rhs_weight = rhs_ref.weight.bitcast(unpack_dtype)
         rhs_ref = dataclasses.replace(rhs_ref, weight=rhs_weight)
 
     # Fill metadata buffer and return number of group & m interations.
@@ -1432,6 +1507,10 @@ def gmm_v2(
 
     aligned_n = align_to(cfgs.out_size_n, num_lanes)
     out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
+    if rhs.dtype == jnp.float4_e2m1fn and pltpu.get_tpu_info().generation < 7:
+        # Transport 4-bit E2M1 weights into Pallas/Mosaic as uint4 on TPU < v7,
+        # avoiding unsupported f4E2M1FN vector unpack in LLO.
+        rhs = lax.bitcast_convert_type(rhs, jnp.uint4)
     rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
 
     return pl.pallas_call(
