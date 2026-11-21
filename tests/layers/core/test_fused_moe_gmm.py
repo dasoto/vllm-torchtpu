@@ -1652,3 +1652,64 @@ def test_ep_ragged_permute_caps_gmm_rows_at_local_expert_bound(monkeypatch):
     )
     np.testing.assert_array_equal(np.asarray(out_cap), np.asarray(out_ref))
 
+
+def test_ep_ragged_permute_preserves_sparsecore_vmem_threshold(monkeypatch):
+    """Capping gather_indices must not push a SparseCore decode batch below
+    ragged_gather_reduce_v2's 60% VMEM threshold (e.g. 512 tokens * 3584 bf16
+    with 128 MiB VMEM floors at 6,144 rows instead of 4,096)."""
+    sc_info = types.SimpleNamespace(num_lanes=8, num_cores=2, num_subcores=16)
+    tpu_info = types.SimpleNamespace(
+        chip_version=pltpu.ChipVersion.TPU_V6E,
+        sparse_core=sc_info,
+        num_lanes=128,
+        vmem_capacity_bytes=128 << 20,
+    )
+    monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info", lambda: tpu_info)
+    monkeypatch.setattr(
+        fused_moe_gmm,
+        "ragged_gather_reduce",
+        fused_moe_gmm.ragged_gather_reduce_v2,
+    )
+    seen_idx_lens = []
+
+    def fake_rg(hs, idx, _off, _cnt):
+        seen_idx_lens.append(idx.shape[0])
+        return jnp.zeros((idx.shape[0], hs.shape[-1]), dtype=hs.dtype)
+
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_v2", fake_rg)
+
+    # Decode batch: 512 tokens, hidden=3584 bf16 -> uncapped 8,192 rows >= 5,618
+    # VMEM cutoff; raw_cap 512*7=3,584 must floor to 5,618 -> aligned 6,144.
+    hs_dec = jnp.zeros((512, 3584), dtype=jnp.bfloat16)
+    ti_dec = jnp.zeros((512, 16), dtype=jnp.int32)
+    tw_dec = jnp.ones((512, 16), dtype=jnp.bfloat16)
+    prepare_routed_gmm_inputs(
+        hs_dec,
+        ti_dec,
+        tw_dec,
+        local_num_experts=7,
+        topk=16,
+        use_ep=True,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=0,
+    )
+    assert seen_idx_lens[-1] == 6144
+    assert seen_idx_lens[-1] * 3584 * 2 * 2 >= tpu_info.vmem_capacity_bytes * 0.6
+
+    # Prefill batch: 14,336 tokens -> raw_cap 14,336*7 = 100,352 (49 * 2,048).
+    hs_pre = jnp.zeros((14336, 3584), dtype=jnp.bfloat16)
+    ti_pre = jnp.zeros((14336, 16), dtype=jnp.int32)
+    tw_pre = jnp.ones((14336, 16), dtype=jnp.bfloat16)
+    prepare_routed_gmm_inputs(
+        hs_pre,
+        ti_pre,
+        tw_pre,
+        local_num_experts=7,
+        topk=16,
+        use_ep=True,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=0,
+    )
+    assert seen_idx_lens[-1] == 100352
+
+

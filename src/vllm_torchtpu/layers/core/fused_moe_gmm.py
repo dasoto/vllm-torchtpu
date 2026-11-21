@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import math
 
 import jax
 from jax import numpy as jnp
@@ -515,12 +516,29 @@ def prepare_routed_gmm_inputs(
                 # `topk / local_num_experts` (2.29x on Kimi-K3.1 EP=128) with
                 # zero approximation.
                 raw_cap = num_tokens_local * local_num_experts
-                sc_info = get_sparse_core_info()
+                try:
+                    tpu_info = pltpu.get_tpu_info()
+                except ValueError:
+                    tpu_info = None
+                sc_info = get_sparse_core_info(tpu_info)
                 align = 256
-                if sc_info is not None:
+                if sc_info is not None and tpu_info is not None:
                     base_block = (
                         sc_info.num_lanes * sc_info.num_cores * sc_info.num_subcores
                     )
+                    # Do not shrink a batch that originally stayed on SparseCore
+                    # below ragged_gather_reduce_v2's VMEM fallback threshold
+                    # (source_rows * row_bytes * 2 >= vmem_capacity_bytes * 0.6).
+                    row_bytes = (
+                        hidden_states_local.shape[-1]
+                        * hidden_states_local.dtype.itemsize
+                    )
+                    vmem_thresh = math.ceil(tpu_info.vmem_capacity_bytes * 0.6)
+                    if gather_indices.shape[0] * row_bytes * 2 >= vmem_thresh:
+                        min_sc_rows = (vmem_thresh + 2 * row_bytes - 1) // (
+                            2 * row_bytes
+                        )
+                        raw_cap = max(raw_cap, min_sc_rows)
                     subchunks = max(
                         1, min(4, (raw_cap + base_block - 1) // base_block)
                     )

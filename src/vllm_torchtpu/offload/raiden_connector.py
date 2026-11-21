@@ -85,6 +85,7 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCacheTensor,
     GPULoadStoreSpec,
     OffloadKey,
+    OffloadPolicy,
 )
 from vllm.v1.outputs import KVConnectorOutput
 
@@ -225,28 +226,37 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         # rank-for-rank across all DCP workers (get_required_kvcache_layout -> None),
         # so DCP-sharded full-attention blocks plus Mamba CoW boundary blocks at
         # hash-aligned interior positions preserve exact per-rank KV layout.
-        group_block_sizes = {c.tokens_per_block for c in self.config.kv_group_configs}
+        non_cow_block_sizes = {
+            c.tokens_per_block
+            for c in self.config.kv_group_configs
+            if not c.requires_cow_source
+        }
+        non_cow_block_size = (
+            next(iter(non_cow_block_sizes)) if len(non_cow_block_sizes) == 1 else 0
+        )
         has_partial_recurrent_group = any(
-            c.requires_cow_source and c.tokens_per_block > self.config.tokens_per_hash
+            c.requires_cow_source and c.tokens_per_block >= self.config.tokens_per_hash
             for c in self.config.kv_group_configs
         )
         if (
             not self.config.supports_partial_tail
             and self.config.dcp_world_size > 1
             and self.config.blocks_per_chunk == 1
-            and len(group_block_sizes) == 1
+            and non_cow_block_size > self.config.tokens_per_hash
             and has_partial_recurrent_group
             and all(
-                c.sliding_window_size_in_chunks is None or c.requires_cow_source
+                c.sliding_window_size_in_chunks is None
+                or (
+                    c.requires_cow_source
+                    and non_cow_block_size % c.tokens_per_block == 0
+                )
                 for c in self.config.kv_group_configs
             )
         ):
             from vllm.v1.core.kv_cache_coordinator import eagle_proof_margin
 
             self.config = self.config._replace(supports_partial_tail=True)
-            self._partial_tail_block_size = (
-                self.config.kv_group_configs[0].tokens_per_block
-            )
+            self._partial_tail_block_size = non_cow_block_size
             alignment = kv_cache_config.cache_hit_alignment_tokens
             partial_hash_hits = (
                 alignment is not None and alignment < self._partial_tail_block_size
@@ -271,6 +281,75 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 self._partial_tail_block_size,
                 self.config.tokens_per_hash,
             )
+
+    def update_state_after_alloc(
+        self, request, blocks, num_external_tokens: int
+    ) -> None:
+        req_status = self._req_status.get(request.request_id)
+        had_partial_tail = (
+            num_external_tokens > 0
+            and req_status is not None
+            and req_status.partial_tail_boundary is not None
+        )
+        super().update_state_after_alloc(request, blocks, num_external_tokens)
+        if (
+            had_partial_tail
+            and req_status is not None
+            and req_status.offloading_context.policy == OffloadPolicy.CHUNK_LEVEL
+        ):
+            # Upstream sets next_stored_chunk_idx = cdiv(num_cached_tokens,
+            # tokens_per_chunk), skipping the partially filled chunk once
+            # resumed prefill completes it and leaving a permanent hole in host
+            # prefix lookup for subsequent turns. Only complete chunks
+            # (num_cached_tokens // tokens_per_chunk) are already stored.
+            num_cached_tokens = (
+                req_status.num_locally_computed_tokens + num_external_tokens
+            )
+            for group_config, group_state in zip(
+                self.config.kv_group_configs, req_status.group_states
+            ):
+                group_state.next_stored_chunk_idx = (
+                    num_cached_tokens // group_config.tokens_per_chunk
+                )
+
+    def _build_partial_tail_store_jobs(self, scheduler_output: SchedulerOutput):
+        block_state = scheduler_output.kv_connector_block_state
+        handoffs = block_state.boundary_state_offloads if block_state else None
+        if (
+            handoffs
+            and self.config.supports_partial_tail
+            and self._partial_tail_block_size > 0
+        ):
+            filtered: dict[str, list[tuple[int, int, int]]] = {}
+            changed = False
+            for req_id, entries in handoffs.items():
+                req_status = self._req_status.get(req_id)
+                if req_status is None:
+                    continue
+                req = req_status.req
+                prompt_cap = min(
+                    req.num_prompt_tokens,
+                    req_status.max_offload_tokens or req.num_prompt_tokens,
+                )
+                kept = [
+                    e
+                    for e in entries
+                    if e[2] % self._partial_tail_block_size == 0 or e[2] <= prompt_cap
+                ]
+                if len(kept) != len(entries):
+                    changed = True
+                if kept:
+                    filtered[req_id] = kept
+            if changed:
+                from dataclasses import replace
+
+                scheduler_output = replace(
+                    scheduler_output,
+                    kv_connector_block_state=replace(
+                        block_state, boundary_state_offloads=filtered
+                    ),
+                )
+        return super()._build_partial_tail_store_jobs(scheduler_output)
 
     def get_num_new_matched_tokens(
         self,

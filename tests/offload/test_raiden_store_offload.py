@@ -4463,7 +4463,7 @@ class TestDcpPartialTailRecall(unittest.TestCase):
             dtype=torch.bfloat16,
         )
         mamba = MambaSpec(
-            block_size=self.DCP_BLOCK,
+            block_size=self.HASH_BLOCK,
             shapes=((2, 8),),
             dtypes=(torch.bfloat16,),
             mamba_cache_mode="align",
@@ -4487,13 +4487,13 @@ class TestDcpPartialTailRecall(unittest.TestCase):
                     ),
                     SimpleNamespace(
                         group_id=self.MAMBA,
-                        tokens_per_block=self.DCP_BLOCK,
+                        tokens_per_block=self.HASH_BLOCK,
                         sliding_window_size_in_chunks=1,
                     ),
                 ]
             ),
             blocks_per_chunk=1,
-            tokens_per_block=[self.DCP_BLOCK, self.DCP_BLOCK],
+            tokens_per_block=[self.DCP_BLOCK, self.HASH_BLOCK],
             tokens_per_hash=self.HASH_BLOCK,
             offload_prompt_only=False,
             extra_config={},
@@ -4554,12 +4554,12 @@ class TestDcpPartialTailRecall(unittest.TestCase):
         self.assertEqual(hit, self.tail_boundary)
         self.assertTrue(load_async)
 
-        # Allocate 3 attention blocks (covering 31,616 tokens) and 3 Mamba blocks
-        # (2 retired nulls + 1 fresh state block at index 2).
+        # Allocate 3 attention blocks (covering 31,616 tokens) and 19 Mamba blocks
+        # (18 retired nulls + 1 fresh state block at index 18 for 31,616 / 1,664).
         attn_blocks = [KVCacheBlock(101), KVCacheBlock(102), KVCacheBlock(103)]
-        mamba_blocks = [KVCacheBlock(0), KVCacheBlock(0), KVCacheBlock(203)]
-        mamba_blocks[0].is_null = True
-        mamba_blocks[1].is_null = True
+        mamba_blocks = [KVCacheBlock(0) for _ in range(18)] + [KVCacheBlock(203)]
+        for blk in mamba_blocks[:-1]:
+            blk.is_null = True
         self.scheduler.update_state_after_alloc(
             self.request,
             KVCacheBlocks(blocks=(attn_blocks, mamba_blocks)),
@@ -4575,6 +4575,11 @@ class TestDcpPartialTailRecall(unittest.TestCase):
             self._hash_key(self.MAMBA, self.tail_boundary),
         }
         self.assertEqual(status.keys, expected_keys)
+        # Only complete 13,312-token chunks (0 and 1) are already stored in
+        # host DRAM; chunk 2 (26,624..39,936) must stay eligible to be stored
+        # once resumed prefill crosses 39,936 so subsequent turns have no hole.
+        req_status = self.scheduler._req_status[self.request.request_id]
+        self.assertEqual(req_status.group_states[0].next_stored_chunk_idx, 2)
 
 
 if __name__ == "__main__":
