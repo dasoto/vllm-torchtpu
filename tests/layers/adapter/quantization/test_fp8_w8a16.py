@@ -215,3 +215,27 @@ def test_w8a16_skips_activation_rounding():
     err_w8a8 = np.abs(w8a8 - ref).max()
     err_w8a16 = np.abs(w8a16 - ref).max()
     assert err_w8a16 <= err_w8a8
+
+
+@pytest.mark.cpu_test
+def test_load_time_int8_in_graph_requantization(monkeypatch):
+    monkeypatch.setenv("REQUANTIZE_WEIGHT_DTYPE", "int8")
+    monkeypatch.setenv("TPU_FP8_LINEAR_IN_GRAPH", "1")
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
+
+    cfg = VllmFp8Config(is_checkpoint_fp8_serialized=False, activation_scheme="dynamic")
+    method = VllmFp8LinearMethodTPU(cfg)
+    layer = torch.nn.Module()
+    torch.manual_seed(0)
+    w_bf16 = torch.randn((_N, _K), dtype=torch.bfloat16)
+    layer.weight = torch.nn.Parameter(w_bf16.clone(), requires_grad=False)
+    method.process_weights_after_loading(layer)
+    assert layer.weight.dtype == torch.int8
+    assert tuple(layer.weight.shape) == (_K, _N)
+    x = torch.randn((16, _K), dtype=torch.bfloat16)
+    out = method.apply(layer, x)
+    ref = x @ w_bf16.T
+    cos = torch.nn.functional.cosine_similarity(
+        out.float().flatten(), ref.float().flatten(), dim=0
+    ).item()
+    assert cos > 0.9999

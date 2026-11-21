@@ -35,6 +35,7 @@ from __future__ import annotations
 import array
 import hashlib
 import sys
+import time
 from collections import OrderedDict
 from functools import wraps
 
@@ -50,6 +51,7 @@ _WAITING_TOKEN_WEIGHT = 4096.0
 _STORAGE_BALANCE_WEIGHT = 6144.0
 _STICKY_LONG_PREFIX_TOKENS = 8_192
 _WARM_FOLLOWUP_MAX_UNCACHED = 65_536
+_PREFILL_DRAIN_TOKENS_PER_SEC = 900.0
 
 
 def _rolling_chunk_digests(
@@ -86,6 +88,23 @@ class _DPPrefixDirectory:
         self.max_entries = max_entries
         self._owners: OrderedDict[bytes, int] = OrderedDict()
         self._engine_counts: list[int] = [0] * num_engines
+        self._engine_prefill_backlog: list[float] = [0.0] * num_engines
+        self._last_decay_t: float | None = None
+
+    def _decay_prefill_backlog(self, now: float | None = None) -> None:
+        cur = time.monotonic() if now is None else now
+        if self._last_decay_t is None:
+            self._last_decay_t = cur
+            return
+        dt = max(0.0, cur - self._last_decay_t)
+        self._last_decay_t = cur
+        if dt <= 0.0:
+            return
+        drained = dt * _PREFILL_DRAIN_TOKENS_PER_SEC
+        for idx in range(self.num_engines):
+            prev = self._engine_prefill_backlog[idx]
+            if prev > 0.0:
+                self._engine_prefill_backlog[idx] = max(0.0, prev - drained)
 
     def cached_tokens_by_engine(self, digests: list[bytes]) -> list[int]:
         """Return deepest matched prefix length (in tokens) for each DP engine."""
@@ -112,8 +131,22 @@ class _DPPrefixDirectory:
                 m ^= lsb
         return cached
 
-    def record(self, digests: list[bytes], eng_idx: int) -> None:
-        if not digests or not (0 <= eng_idx < self.num_engines):
+    def record(
+        self,
+        digests: list[bytes],
+        eng_idx: int,
+        prompt_len: int = 0,
+        now: float | None = None,
+    ) -> None:
+        if not (0 <= eng_idx < self.num_engines):
+            return
+        if prompt_len > 0:
+            self._decay_prefill_backlog(now)
+            matched = self.cached_tokens_by_engine(digests)[eng_idx]
+            uncached = max(0, prompt_len - matched)
+            if uncached > 0:
+                self._engine_prefill_backlog[eng_idx] += float(uncached)
+        if not digests:
             return
         bit = 1 << eng_idx
         owners = self._owners
@@ -146,7 +179,9 @@ class _DPPrefixDirectory:
         inflight_by_idx: list[int],
         client_count: int,
         eng_start_index: int,
+        now: float | None = None,
     ) -> tuple[int, list[bytes]]:
+        self._decay_prefill_backlog(now)
         digests = _rolling_chunk_digests(prompt_token_ids, self.chunk_tokens)
         cached = self.cached_tokens_by_engine(digests)
         prompt_len = len(prompt_token_ids)
@@ -168,11 +203,12 @@ class _DPPrefixDirectory:
             local_inflight = client_count * inflight_by_idx[idx]
             unreported = max(0, local_inflight - (waiting + running))
             eff_waiting = float(waiting + unreported)
-            if (
+            is_warm_home = (
                 long_warm_session
                 and cached[idx] >= _STICKY_LONG_PREFIX_TOKENS
                 and (prompt_len - cached[idx]) <= _WARM_FOLLOWUP_MAX_UNCACHED
-            ):
+            )
+            if is_warm_home:
                 # Warm long-context follow-ups are promoted ahead of cold waiting
                 # prefills by SrptPrefillScheduler; do not spill them to a cold
                 # DP engine where recomputing 50K-180K tokens stalls all EP ranks.
@@ -182,6 +218,8 @@ class _DPPrefixDirectory:
                 eff_running * _RUNNING_TOKEN_WEIGHT
                 + eff_waiting * _WAITING_TOKEN_WEIGHT * (1.0 + 2.0 * kv_usage)
             )
+            if not is_warm_home:
+                load_cost += self._engine_prefill_backlog[idx]
             uncached = float(max(0, prompt_len - cached[idx])) * uncached_scale
             storage_ratio = self._engine_counts[idx] / avg_blocks
             cost = (
@@ -255,7 +293,9 @@ def patch_dp_prefix_routing() -> None:
         finally:
             request.data_parallel_rank = None
         actual_idx = self._tpu_eng_to_idx.get(engine, chosen_idx)
-        directory.record(digests, actual_idx)
+        directory.record(
+            digests, actual_idx, prompt_len=len(request.prompt_token_ids)
+        )
         return engine
 
     setattr(get_core_engine_for_request, marker, True)

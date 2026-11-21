@@ -1405,10 +1405,23 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         if quant_config.is_checkpoint_fp8_serialized:
             self._linear_quant_config = _get_linear_quant_config(self.linear_config)
         else:
-            # Load-time quantization has its own fixed per-channel contract.
+            # Load-time quantization uses per-channel scaling and respects
+            # REQUANTIZE_WEIGHT_DTYPE (e.g. int8 on TPU v6e or float8_e4m3fn).
+            desired_dtype = (
+                self.linear_config.requant_weight_dtype
+                if self.linear_config is not None
+                else envs.REQUANTIZE_WEIGHT_DTYPE
+            ) or "float8_e4m3fn"
+            requant_dtype = _MOE_REQUANT_WEIGHT_DTYPES.get(desired_dtype)
+            if requant_dtype is None:
+                supported = ", ".join(sorted(_MOE_REQUANT_WEIGHT_DTYPES))
+                raise ValueError(
+                    "Unsupported REQUANTIZE_WEIGHT_DTYPE="
+                    f"{desired_dtype!r}. Supported values: {supported}."
+                )
             self._linear_quant_config = (
-                "float8_e4m3fn",
-                torch.float8_e4m3fn,
+                desired_dtype,
+                requant_dtype,
                 None,
                 False,
             )

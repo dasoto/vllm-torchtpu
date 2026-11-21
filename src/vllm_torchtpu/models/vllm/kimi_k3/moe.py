@@ -21,10 +21,14 @@ from typing import TYPE_CHECKING, cast
 import torch
 from torch import nn
 from vllm.config import get_current_vllm_config_or_none
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import RowParallelLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
@@ -36,6 +40,7 @@ from vllm_torchtpu.layers.adapter.moe_hierarchical import (
     hierarchical_moe_parallel_config,
     hierarchical_split_or_none,
 )
+from vllm_torchtpu.layers.adapter.quantization.unquantized import VllmUnquantizedConfig
 
 from .collective_ops import FusedPrefillCollectives
 from .layers import KimiMLP
@@ -93,11 +98,13 @@ class KimiMoE(nn.Module):
             else hidden_size
         )
 
+        gate_quant_config = VllmUnquantizedConfig() if quant_config is not None else None
         self.gate = GateLinear(
             input_size=hidden_size,
             output_size=config.num_experts,
             bias=False,
             out_dtype=torch.float32,
+            quant_config=gate_quant_config,
             prefix=f"{prefix}.gate",
         )
         self.gate.e_score_correction_bias = nn.Parameter(
@@ -105,14 +112,23 @@ class KimiMoE(nn.Module):
         )
 
         # Replicated by default; sharded across a chip's cores under
-        # TPU_LATENT_PROJ_INTRA_CHIP_TP. These two are the model's largest
-        # unquantized weights and are read in full by every rank each step.
+        # TPU_LATENT_PROJ_INTRA_CHIP_TP. Pass quant_config so TPU's dense
+        # loader transposes to canonical (k, n) layout and honors
+        # QUANTIZE_ON_LOAD_PREFIXES. When TP > 1 (non-SP), shard
+        # routed_expert_up_proj row-parallel across TP with reduce_results=False
+        # and fuse its reduction with shared_experts in one TP all-reduce.
+        self._fuse_tp_up_proj = (
+            not envs.TPU_K3_SP_PREFILL
+            and routed_expert_hidden_size is not None
+            and self.tp_size > 1
+            and expert_hidden_size % self.tp_size == 0
+        )
         self.routed_expert_down_proj = (
             make_latent_projection(
                 hidden_size,
                 expert_hidden_size,
                 bias=False,
-                quant_config=None,
+                quant_config=quant_config,
                 prefix=f"{prefix}.routed_expert_down_proj",
             )
             if routed_expert_hidden_size is not None
@@ -123,22 +139,30 @@ class KimiMoE(nn.Module):
             if self.routed_expert_down_proj is not None and config.latent_moe_use_norm
             else None
         )
-        self.routed_expert_up_proj = (
-            make_latent_projection(
+        if self.routed_expert_down_proj is None:
+            self.routed_expert_up_proj = None
+        elif self._fuse_tp_up_proj:
+            self.routed_expert_up_proj = RowParallelLinear(
                 expert_hidden_size,
                 hidden_size,
                 bias=False,
-                quant_config=None,
+                quant_config=quant_config,
+                reduce_results=False,
                 prefix=f"{prefix}.routed_expert_up_proj",
             )
-            if self.routed_expert_down_proj is not None
-            else None
-        )
+        else:
+            self.routed_expert_up_proj = make_latent_projection(
+                expert_hidden_size,
+                hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.routed_expert_up_proj",
+            )
         routed_output_transform = (
             KimiRoutedOutputTransform(
                 self.routed_expert_norm, self.routed_expert_up_proj
             )
-            if self.routed_expert_up_proj is not None
+            if (self.routed_expert_up_proj is not None and not self._fuse_tp_up_proj)
             else None
         )
 
@@ -188,7 +212,7 @@ class KimiMoE(nn.Module):
         # within one chip, instead of vLLM's flat all-experts-per-device EP.
         with hierarchical_moe_parallel_config():
             self.experts = FusedMoEFactory(
-                shared_experts=self.shared_experts,
+                shared_experts=(None if self._fuse_tp_up_proj else self.shared_experts),
                 num_experts=config.num_experts,
                 top_k=config.num_experts_per_token,
                 hidden_size=expert_hidden_size,
@@ -270,6 +294,14 @@ class KimiMoE(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_size)
         router_logits, _ = self.gate(hidden_states)
         output = self.experts(hidden_states=hidden_states, router_logits=router_logits)
+        if self._fuse_tp_up_proj:
+            if self.routed_expert_norm is not None:
+                output = self.routed_expert_norm(output)
+            assert self.routed_expert_up_proj is not None
+            output, _ = self.routed_expert_up_proj(output)
+            if self.shared_experts is not None:
+                output = output + self.shared_experts(hidden_states)
+            output = tensor_model_parallel_all_reduce(output)
         return output.view(num_tokens, hidden_size)
 
     def _forward_expert_parallel(

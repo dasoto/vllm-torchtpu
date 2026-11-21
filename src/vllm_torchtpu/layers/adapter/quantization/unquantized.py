@@ -199,9 +199,14 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
             A QuantizeMethodBase implementation, or None to use defaults.
         """
         if isinstance(layer, (LinearBase, VocabParallelEmbedding)):
-            # Skip kv_b_proj: MLAAttention slices W_UK_T/W_UV from unquantized
-            # kv_b_proj.weight and quantizes them separately after loading.
-            if should_quantize_on_load(prefix) and "kv_b_proj" not in prefix.split("."):
+            # Skip kv_b_proj (MLAAttention slices W_UK_T/W_UV from unquantized
+            # kv_b_proj.weight) and small router/indexer gates (gate, wk_weights_proj).
+            leaf = prefix.rsplit(".", 1)[-1]
+            if should_quantize_on_load(prefix) and leaf not in (
+                "kv_b_proj",
+                "wk_weights_proj",
+                "gate",
+            ):
                 fp8_config = VllmFp8Config(
                     is_checkpoint_fp8_serialized=False,
                     activation_scheme="dynamic",

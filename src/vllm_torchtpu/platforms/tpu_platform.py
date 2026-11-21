@@ -527,6 +527,10 @@ class TpuPlatform(Platform):
         "TPU_STREAMIDX_SMALL_BUCKET_BKVP",
         "TPU_STREAMIDX_SMALL_BUCKET_TOKENS",
         "TPU_STREAMIDX_CHUNK_TOKENS",
+        "QUANTIZE_ON_LOAD_PREFIXES",
+        "TPU_FP8_LINEAR_IN_GRAPH",
+        "TPU_MOE_COLLECTION_CHUNK_SIZE",
+        "TPU_MOE_FP8_ALL_GATHER",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import

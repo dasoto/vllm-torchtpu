@@ -225,6 +225,46 @@ class TestDPPrefixDirectory(unittest.TestCase):
         self.assertEqual(client.get_core_engine_for_request(req_pinned), "e1")
         self.assertEqual(req_pinned.data_parallel_rank, 1)
 
+    def test_cold_prefill_backlog_spreads_80k_arrivals_while_warm_sticks(self):
+        directory = _DPPrefixDirectory(num_engines=4, chunk_tokens=512)
+        cold_0 = [10_000 + i for i in range(81_920)]
+        eng0, dig0 = directory.select_engine(
+            prompt_token_ids=cold_0,
+            lb_engines=[(0, 0, 0.1)] * 4,
+            inflight_by_idx=[0] * 4,
+            client_count=1,
+            eng_start_index=0,
+            now=100.0,
+        )
+        self.assertEqual(eng0, 0)
+        directory.record(dig0, eng0, prompt_len=len(cold_0), now=100.0)
+
+        # Even if engine 0 now reports (waiting=0, running=1) while engines 1..3
+        # have 3 fast decodes (running=3), engine 0 still has ~81K uncached
+        # prefill tokens in flight and must not receive a second 80K cold prompt.
+        lb = [(0, 1, 0.1), (0, 3, 0.1), (0, 3, 0.1), (0, 3, 0.1)]
+        cold_1 = [200_000 + i for i in range(81_920)]
+        eng1, _ = directory.select_engine(
+            prompt_token_ids=cold_1,
+            lb_engines=lb,
+            inflight_by_idx=[1, 3, 3, 3],
+            client_count=1,
+            eng_start_index=0,
+            now=101.0,
+        )
+        self.assertNotEqual(eng1, 0)
+
+        # Warm follow-up on session 0 still sticks to engine 0.
+        eng_warm, _ = directory.select_engine(
+            prompt_token_ids=cold_0 + [77] * 2_048,
+            lb_engines=lb,
+            inflight_by_idx=[1, 3, 3, 3],
+            client_count=1,
+            eng_start_index=0,
+            now=102.0,
+        )
+        self.assertEqual(eng_warm, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

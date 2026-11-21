@@ -105,7 +105,7 @@ class KimiDSAIndexer(nn.Module):
             config.hidden_size,
             [self.head_dim, self.n_head],
             bias=False,
-            quant_config=None,
+            quant_config=vllm_config.quant_config,
             disable_tp=True,
             prefix=f"{prefix}.wk_weights_proj",
         )
