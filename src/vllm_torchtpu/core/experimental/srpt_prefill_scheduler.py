@@ -68,8 +68,9 @@ Select with ``--scheduler-cls``
 
 import math
 import time
+from collections import OrderedDict
 from itertools import chain, islice
-from typing import cast
+from typing import Any, cast
 
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -88,8 +89,11 @@ logger = init_logger(__name__)
 
 _MAX_BACKOFF_SHIFT = 6
 _ATTN_CAP_LOG_EVERY = 10000
-_WARM_WINDOW = 64
+_WARM_WINDOW = 128
 _WARM_STARVATION_SECONDS = 90.0
+_WARM_FOLLOWUP_MIN_HIT_TOKENS = 8192
+_WARM_FOLLOWUP_MAX_UNCACHED_TOKENS = 32768
+_MAX_EXTERNAL_BLOCK_HASHES = 65536
 
 
 class SrptPrefillScheduler(AsyncScheduler):
@@ -104,6 +108,10 @@ class SrptPrefillScheduler(AsyncScheduler):
         self._stalled_steps: dict[str, int] = {}
         # Target request id -> (failed holds, first step a hold may retry).
         self._hold_backoff: dict[str, tuple[int, int]] = {}
+        # Bounded LRU directory of block hashes offloaded to external KV tiers
+        # (e.g. Raiden Host DRAM) so warm sessions evicted from HBM are still
+        # recognized as short-uncached follow-ups without touching connector state.
+        self._external_block_hashes: OrderedDict[Any, None] = OrderedDict()
         self.attn_work_cap = envs.VLLM_TPU_SRPT_ATTN_WORK_CAP
         self.attn_tile_tokens = max(envs.VLLM_TPU_SRPT_ATTN_TILE_TOKENS, 1)
         self.cadence_no_escape = envs.VLLM_TPU_PREFILL_CADENCE_NO_ESCAPE
@@ -132,8 +140,73 @@ class SrptPrefillScheduler(AsyncScheduler):
             self.promote_warm_waiting,
         )
 
+    def _record_external_block_hashes(self, output: SchedulerOutput) -> None:
+        if self.connector is None or not output.num_scheduled_tokens:
+            return
+        tokens_per_hash = max(int(self.cache_config.block_size or 1), 1)
+        ext = self._external_block_hashes
+        for req_id, n_sched in output.num_scheduled_tokens.items():
+            if n_sched <= 0:
+                continue
+            req = self.requests.get(req_id)
+            if req is None or not req.block_hashes:
+                continue
+            n_full = min(
+                len(req.block_hashes), req.num_computed_tokens // tokens_per_hash
+            )
+            for h in req.block_hashes[:n_full]:
+                if h in ext:
+                    ext.move_to_end(h)
+                else:
+                    if len(ext) >= _MAX_EXTERNAL_BLOCK_HASHES:
+                        ext.popitem(last=False)
+                    ext[h] = None
+
+    def _estimated_prefix_hit_tokens(
+        self, request: Request, local_hit_tokens: int | None = None
+    ) -> int:
+        if local_hit_tokens is None:
+            _, local_hit_tokens = self._prefix_hit(request)
+        if (
+            self.connector is None
+            or not self._external_block_hashes
+            or not request.block_hashes
+            or request.num_computed_tokens > 0
+        ):
+            return local_hit_tokens
+        ext = self._external_block_hashes
+        matched_blocks = 0
+        for h in request.block_hashes:
+            if h not in ext:
+                break
+            matched_blocks += 1
+        if matched_blocks <= 0:
+            return local_hit_tokens
+        tokens_per_hash = max(int(self.cache_config.block_size or 1), 1)
+        ext_tokens = min(
+            matched_blocks * tokens_per_hash,
+            max(request.num_prompt_tokens - 1, 0),
+        )
+        conn_sched = getattr(self.connector, "_scheduler", None)
+        conn_cfg = getattr(conn_sched, "config", None)
+        align = getattr(conn_cfg, "alignment_tokens", None)
+        if isinstance(align, int) and align > 0:
+            ext_tokens = (ext_tokens // align) * align
+        return max(local_hit_tokens, ext_tokens)
+
+    def reset_prefix_cache(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> bool:
+        ok = super().reset_prefix_cache(
+            reset_running_requests=reset_running_requests,
+            reset_connector=reset_connector,
+        )
+        if ok and reset_connector:
+            self._external_block_hashes.clear()
+        return ok
+
     def _maybe_promote_warm_waiting(self) -> None:
-        """Promote ready request with fewest uncached prompt tokens in WINDOW."""
+        """Promote ready requests with fewest uncached prompt tokens in WINDOW."""
         if (
             not self.promote_warm_waiting
             or self.policy != SchedulingPolicy.FCFS
@@ -150,31 +223,55 @@ class SrptPrefillScheduler(AsyncScheduler):
         now = time.time()
         kv_fetch_stages = getattr(self, "_kv_fetch_stages", None) or {}
         has_inflight_prefills = bool(getattr(self, "_inflight_prefills", None))
+        key_cache: dict[str, tuple[int, int, int, float]] = {}
 
         def rank_key(req: Request) -> tuple[int, int, int, float]:
-            _, hit = self._prefix_hit(req)
-            uncached = max(req.num_tokens - hit, 0)
+            cached_key = key_cache.get(req.request_id)
+            if cached_key is not None:
+                return cached_key
+            est_hit = self._estimated_prefix_hit_tokens(req)
+            uncached = max(req.num_tokens - est_hit, 0)
             is_stalled_fetch = kv_fetch_stages.get(req) == KV_FETCH_WAITING_TO_START
-            urgent = not is_stalled_fetch and (
+            if not is_stalled_fetch and (
                 req.num_preemptions > 0
                 or uncached <= 8192
                 or (now - req.arrival_time) > _WARM_STARVATION_SECONDS
-            )
-            # Always let urgent local-HBM hits jump ahead of a stalled async
-            # fetch. Only let cold long prefills jump ahead of a stalled async
-            # fetch when no in-flight prefill is currently running (otherwise
-            # admitting another cold long prefill inflates `_inflight_prefills`
-            # reservations and further delays the warm external KV load).
+            ):
+                tier = 0
+            elif (
+                not is_stalled_fetch
+                and est_hit >= _WARM_FOLLOWUP_MIN_HIT_TOKENS
+                and uncached <= _WARM_FOLLOWUP_MAX_UNCACHED_TOKENS
+            ):
+                tier = 1
+            else:
+                tier = 2
+            # Always let urgent/warm hits jump ahead of a stalled async fetch.
+            # Only let cold long prefills jump ahead of a stalled async fetch
+            # when no in-flight prefill is currently running.
             demote_stalled_cold = (
                 1 if (is_stalled_fetch and not has_inflight_prefills) else 0
             )
-            return (0 if urgent else 1, demote_stalled_cold, uncached, req.arrival_time)
+            res = (tier, demote_stalled_cold, uncached, req.arrival_time)
+            key_cache[req.request_id] = res
+            return res
+
+        queue = cast(FCFSRequestQueue, self.waiting)
+        promotable = [r for r in ready if rank_key(r)[0] < 2]
+        if promotable:
+            ordered = sorted(promotable, key=rank_key)
+            if ready[: len(ordered)] != ordered:
+                for req in ordered:
+                    queue.remove(req)
+                for req in reversed(ordered):
+                    self.waiting.prepend_request(req)
+            return
 
         head_req = ready[0]
         head_key = rank_key(head_req)
         best_req = min(ready, key=rank_key)
         if best_req is not head_req and rank_key(best_req) < head_key:
-            cast(FCFSRequestQueue, self.waiting).remove(best_req)
+            queue.remove(best_req)
             self.waiting.prepend_request(best_req)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
@@ -231,6 +328,8 @@ class SrptPrefillScheduler(AsyncScheduler):
             self.max_num_running_reqs += len(held)
             self.max_num_active_reqs += len(held)
             self.running.extend(held)
+
+        self._record_external_block_hashes(output)
 
         # One KV cache block of the main attention group; not self.block_size,
         # which for hybrid models is the LCM of all group block sizes and can
@@ -494,7 +593,8 @@ class SrptPrefillScheduler(AsyncScheduler):
             return [], None
 
         hit_blocks, hit_tokens = self._prefix_hit(target)
-        target_remaining = max(target.num_tokens - hit_tokens, 1)
+        est_hit_tokens = self._estimated_prefix_hit_tokens(target, hit_tokens)
+        target_remaining = max(target.num_tokens - est_hit_tokens, 1)
         _, num_waiting = self.get_request_counts()
         kept = list(self.running)
         held: list[Request] = []
@@ -505,11 +605,11 @@ class SrptPrefillScheduler(AsyncScheduler):
             admit = min(need, left)
             if self._attn_cap_on and admit > 0:
                 admit = self._attn_cap_tokens(
-                    hit_tokens, admit, work, prefill_scheduled
+                    est_hit_tokens, admit, work, prefill_scheduled
                 )
             # Enough budget, and the cap lets the target reach the next tile.
             if left >= need and admit >= min(
-                need, self._tokens_to_next_tile(hit_tokens)
+                need, self._tokens_to_next_tile(est_hit_tokens)
             ):
                 break
             # Non-stalled prefill chunks sit last in `kept`, ordered by
@@ -538,7 +638,10 @@ class SrptPrefillScheduler(AsyncScheduler):
             held.append(candidate)
         if not held or admit <= 0:
             return [], None
-        if not self._kv_fits_hold(kept, alloc, target, hit_blocks, hit_tokens, admit):
+        kv_admit_tokens = (est_hit_tokens - hit_tokens) + admit
+        if not self._kv_fits_hold(
+            kept, alloc, target, hit_blocks, hit_tokens, kv_admit_tokens
+        ):
             return [], None
         return held, target
 

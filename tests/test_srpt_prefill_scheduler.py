@@ -789,6 +789,101 @@ def test_promote_warm_waiting_bypasses_stalled_kv_fetch(shared_model_config):
     assert list(scheduler.waiting)[0].request_id == "cold_ready"
 
 
+def test_promote_warm_waiting_promotes_multiple_warm_requests_in_order(
+    shared_model_config,
+):
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        num_blocks=128,
+        max_num_seqs=8,
+        max_num_batched_tokens=64,
+    )
+    scheduler.promote_warm_waiting = True
+    # Populate prefix cache with two conversation prefixes (48 and 32 tokens).
+    seed_a = _make_real_request("seed_a", 48, hasher, seed=301)
+    seed_b = _make_real_request("seed_b", 32, hasher, seed=302)
+    scheduler.add_request(seed_a)
+    assert scheduler.schedule().num_scheduled_tokens == {"seed_a": 48}
+    scheduler.schedule()
+    scheduler.finish_requests("seed_a", RequestStatus.FINISHED_ABORTED)
+    scheduler.add_request(seed_b)
+    assert scheduler.schedule().num_scheduled_tokens == {"seed_b": 32}
+    scheduler.schedule()
+    scheduler.finish_requests("seed_b", RequestStatus.FINISHED_ABORTED)
+    scheduler.schedule()
+
+    # Enqueue two long cold requests ahead of two short warm follow-ups:
+    # warm_b has 32 uncached tokens, warm_a has 16 uncached tokens; both fit
+    # together in a single 64-token step (`16 + 32 = 48 <= 64`) once promoted!
+    scheduler.add_request(_make_real_request("cold_1", 128, hasher, seed=310))
+    scheduler.add_request(_make_real_request("cold_2", 128, hasher, seed=311))
+    scheduler.add_request(
+        _make_real_request(
+            "warm_b", 64, hasher, seed=312, shared_prefix=list(seed_b.prompt_token_ids)
+        )
+    )
+    scheduler.add_request(
+        _make_real_request(
+            "warm_a", 64, hasher, seed=313, shared_prefix=list(seed_a.prompt_token_ids)
+        )
+    )
+    out = scheduler.schedule()
+    assert list(out.num_scheduled_tokens.keys())[:2] == ["warm_a", "warm_b"]
+    assert out.num_scheduled_tokens["warm_a"] == 16
+    assert out.num_scheduled_tokens["warm_b"] == 32
+
+
+def test_estimated_prefix_hit_uses_external_connector_hashes_after_hbm_reset(
+    shared_model_config,
+):
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        num_blocks=128,
+        max_num_seqs=8,
+        max_num_batched_tokens=64,
+    )
+    # Attach a stub external connector with 32-token chunk alignment.
+    stub_conn = SimpleNamespace(
+        _scheduler=SimpleNamespace(config=SimpleNamespace(alignment_tokens=32)),
+        supports_divergent_local_hybrid_hits=False,
+        requires_kv_delivery=False,
+        on_new_request=lambda req: None,
+        get_num_new_matched_tokens=lambda req, n: (0, False),
+        update_state_after_alloc=lambda req, blocks, n: None,
+        build_connector_meta=lambda out: None,
+        request_finished=lambda req, block_ids: (False, None),
+        has_connector_metadata=lambda: False,
+        has_pending_block_frees=lambda: False,
+        has_pending_push_work=lambda: False,
+        reset_cache=lambda: True,
+        get_external_cache_hit_sources=lambda req_ids: {},
+    )
+    scheduler.connector = stub_conn
+    seed_req = _make_real_request("seed_ext", 48, hasher, seed=401)
+    scheduler.add_request(seed_req)
+    scheduler.schedule()
+    scheduler.connector = None
+    scheduler.finish_requests("seed_ext", RequestStatus.FINISHED_ABORTED)
+    scheduler.schedule()
+
+    # Flush local HBM prefix cache without resetting external connector tier.
+    assert scheduler.reset_prefix_cache(reset_connector=False) is True
+    scheduler.connector = stub_conn
+    followup = _make_real_request(
+        "followup_ext",
+        64,
+        hasher,
+        seed=402,
+        shared_prefix=list(seed_req.prompt_token_ids),
+    )
+    # 48 matched hash tokens aligned down to 32-token connector chunk -> 32 tokens.
+    assert scheduler._estimated_prefix_hit_tokens(followup) == 32
+    scheduler.connector = None
+    assert scheduler.reset_prefix_cache(reset_connector=True) is True
+    scheduler.connector = stub_conn
+    assert scheduler._estimated_prefix_hit_tokens(followup) == 0
+
+
 def test_tpu_runner_any_decode_enabled_by_cadence_no_escape(monkeypatch):
     import numpy as np
 
