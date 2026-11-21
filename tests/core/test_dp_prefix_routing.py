@@ -265,6 +265,18 @@ class TestDPPrefixDirectory(unittest.TestCase):
         )
         self.assertEqual(eng_warm, 0)
 
+        # Once engine 0 reports completely idle (0 waiting, 0 running, 0 inflight),
+        # its estimated prefill backlog resets to 0 immediately.
+        directory.select_engine(
+            prompt_token_ids=[300_000 + i for i in range(1024)],
+            lb_engines=[(0, 0, 0.1), (0, 2, 0.1), (0, 2, 0.1), (0, 2, 0.1)],
+            inflight_by_idx=[0, 2, 2, 2],
+            client_count=1,
+            eng_start_index=0,
+            now=103.0,
+        )
+        self.assertEqual(directory._engine_prefill_backlog[0], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

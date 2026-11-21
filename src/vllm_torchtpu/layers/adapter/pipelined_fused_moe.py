@@ -110,15 +110,20 @@ enable_pipeline_collective_and_compute = enable_pipelined_collective_and_compute
 def _quantized_all_gather(
     collective_group, hidden_states: torch.Tensor
 ) -> torch.Tensor:
-    """All-gather activations in fp8, restored on arrival."""
+    """All-gather activations in fp8 (or int8 when REQUANTIZE_WEIGHT_DTYPE=int8), restored on arrival."""
     out_dtype = hidden_states.dtype
+    q_dtype = (
+        torch.int8
+        if envs.REQUANTIZE_WEIGHT_DTYPE == "int8"
+        else torch.float8_e4m3fn
+    )
     quantized, scale = quantize_tensor(
-        hidden_states, quant_dtype=torch.float8_e4m3fn, axis=-1
+        hidden_states, quant_dtype=q_dtype, axis=-1
     )
     ag_rows = collective_group.all_gather(quantized.view(torch.int8), dim=0)
     ag_scale = collective_group.all_gather(scale, dim=0)
     ag_hidden_states = dequantize_tensor(
-        ag_rows.view(torch.float8_e4m3fn), ag_scale, axis=-1, out_dtype=out_dtype
+        ag_rows.view(q_dtype), ag_scale, axis=-1, out_dtype=out_dtype
     )
     return ag_hidden_states
 

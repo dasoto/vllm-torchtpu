@@ -1115,3 +1115,21 @@ def test_fixed_chunk_collection_splits_every_bucket_alike(monkeypatch):
         # A single rank gathers nothing and keeps one chunk.
         assert pfm.collection_chunks(512, 1) == (1, 512)
     assert pfm.collection_chunks(2048, 8) == (4, 512)
+
+
+def test_quantized_all_gather_uses_int8_when_requantize_dtype_is_int8(monkeypatch):
+    from vllm_torchtpu.layers.adapter import pipelined_fused_moe as pfm
+
+    dp_group = _MockCollectiveGroup(world_size=2, rank=0)
+    hs = torch.linspace(-3.0, 3.0, 4 * 64, dtype=torch.bfloat16).reshape(4, 64)
+
+    monkeypatch.setattr(envs, "REQUANTIZE_WEIGHT_DTYPE", "int8")
+    out_int8 = pfm._quantized_all_gather(dp_group, hs)
+    assert out_int8.shape == (8, 64)
+    assert out_int8.dtype == torch.bfloat16
+    expected = torch.cat([hs, hs], dim=0)
+    cos = torch.nn.functional.cosine_similarity(
+        out_int8.float().flatten(), expected.float().flatten(), dim=0
+    )
+    assert float(cos) > 0.9999
+    assert dp_group.call_log[0] == ("all_gather", torch.Size([4, 64]), torch.int8)

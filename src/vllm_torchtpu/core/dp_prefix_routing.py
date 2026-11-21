@@ -51,7 +51,7 @@ _WAITING_TOKEN_WEIGHT = 4096.0
 _STORAGE_BALANCE_WEIGHT = 6144.0
 _STICKY_LONG_PREFIX_TOKENS = 8_192
 _WARM_FOLLOWUP_MAX_UNCACHED = 65_536
-_PREFILL_DRAIN_TOKENS_PER_SEC = 900.0
+_PREFILL_DRAIN_TOKENS_PER_SEC = 750.0
 
 
 def _rolling_chunk_digests(
@@ -201,6 +201,8 @@ class _DPPrefixDirectory:
             idx = (eng_start_index + offset) % self.num_engines
             waiting, running, kv_usage = lb_engines[idx]
             local_inflight = client_count * inflight_by_idx[idx]
+            if waiting == 0 and running == 0 and local_inflight == 0:
+                self._engine_prefill_backlog[idx] = 0.0
             unreported = max(0, local_inflight - (waiting + running))
             eff_waiting = float(waiting + unreported)
             is_warm_home = (
