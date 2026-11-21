@@ -22,7 +22,9 @@ import torch
 from torch import nn
 from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    model_parallel_is_initialized,
     tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
@@ -86,6 +88,7 @@ class KimiMoE(nn.Module):
         self.prefix = prefix
         hidden_size = config.hidden_size
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank = 0
         vllm_config = get_current_vllm_config_or_none()
         self.use_ep = (
             vllm_config is not None
@@ -123,6 +126,7 @@ class KimiMoE(nn.Module):
             and self.tp_size > 1
             and expert_hidden_size % self.tp_size == 0
         )
+        self._tp_rank_buf: torch.Tensor | None
         self.routed_expert_down_proj = (
             make_latent_projection(
                 hidden_size,
@@ -150,6 +154,21 @@ class KimiMoE(nn.Module):
                 reduce_results=False,
                 prefix=f"{prefix}.routed_expert_up_proj",
             )
+            up_tp_rank = getattr(self.routed_expert_up_proj, "tp_rank", None)
+            self.tp_rank = (
+                int(up_tp_rank)
+                if up_tp_rank is not None
+                else (
+                    get_tensor_model_parallel_rank()
+                    if model_parallel_is_initialized()
+                    else 0
+                )
+            )
+            self.register_buffer(
+                "_tp_rank_buf",
+                torch.tensor([self.tp_rank], dtype=torch.long),
+                persistent=False,
+            )
         else:
             self.routed_expert_up_proj = make_latent_projection(
                 expert_hidden_size,
@@ -158,6 +177,8 @@ class KimiMoE(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.routed_expert_up_proj",
             )
+        if not self._fuse_tp_up_proj:
+            self.register_buffer("_tp_rank_buf", None, persistent=False)
         routed_output_transform = (
             KimiRoutedOutputTransform(
                 self.routed_expert_norm, self.routed_expert_up_proj
@@ -285,6 +306,16 @@ class KimiMoE(nn.Module):
             bias_param.copy_(bias)
             weight_param.copy_(weight)
 
+    def process_weights_after_loading(self) -> None:
+        self.initialize_dummy_router()
+        if self._fuse_tp_up_proj:
+            device = self.gate.weight.device
+            self.register_buffer(
+                "_tp_rank_buf",
+                torch.tensor([self.tp_rank], dtype=torch.long, device=device),
+                persistent=False,
+            )
+
     def forward(
         self, hidden_states: torch.Tensor, sequence_parallel: bool = False
     ) -> torch.Tensor:
@@ -298,6 +329,12 @@ class KimiMoE(nn.Module):
             if self.routed_expert_norm is not None:
                 output = self.routed_expert_norm(output)
             assert self.routed_expert_up_proj is not None
+            assert self._tp_rank_buf is not None
+            output = (
+                output.unflatten(-1, (self.tp_size, -1))
+                .index_select(-2, self._tp_rank_buf)
+                .squeeze(-2)
+            )
             output, _ = self.routed_expert_up_proj(output)
             if self.shared_experts is not None:
                 output = output + self.shared_experts(hidden_states)

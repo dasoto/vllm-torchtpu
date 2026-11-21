@@ -424,7 +424,7 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
             if isinstance(module, AttentionResidual):
                 module.process_weights_after_loading()
             elif isinstance(module, KimiMoE):
-                module.initialize_dummy_router()
+                module.process_weights_after_loading()
             elif isinstance(module, MultiHeadLatentAttention):
                 module.prepare_sp_mla_gate()
 

@@ -2901,16 +2901,24 @@ def test_kimi_k31_indexer_matches_reference_math(monkeypatch, request) -> None:
 def test_kimi_moe_fuses_tp_row_parallel_up_proj_and_shared_all_reduce(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    tp_size = 4
+    expert_hidden = 8
+    hidden_size = 16
+    full_up_w = torch.randn((hidden_size, expert_hidden), dtype=torch.bfloat16)
+    routed_out = torch.randn((3, expert_hidden), dtype=torch.bfloat16)
+    current_tp_rank = 0
     all_reduces: list[torch.Tensor] = []
 
     def fake_all_reduce(t: torch.Tensor) -> torch.Tensor:
         all_reduces.append(t)
-        return t * 2.0
+        return t
 
     class FakeGate(nn.Module):
         def __init__(self, *args, **kwargs) -> None:
             super().__init__()
             self.quant_config = kwargs.get("quant_config")
+            self.weight = nn.Parameter(torch.zeros((4, hidden_size)))
+            self.input_size = hidden_size
 
         def forward(self, x: torch.Tensor):
             return x.new_zeros((x.shape[0], 4), dtype=torch.float32), None
@@ -2920,11 +2928,18 @@ def test_kimi_moe_fuses_tp_row_parallel_up_proj_and_shared_all_reduce(
             super().__init__()
             self.in_sz = in_sz
             self.out_sz = out_sz
+            self.tp_rank = current_tp_rank
+            self.part_in = in_sz // tp_size
             self.reduce_results = kwargs["reduce_results"]
             self.quant_config = kwargs["quant_config"]
+            w_slice = full_up_w[
+                :, current_tp_rank * self.part_in : (current_tp_rank + 1) * self.part_in
+            ]
+            self.weight_kn = w_slice.t().contiguous()
 
         def forward(self, x: torch.Tensor):
-            return torch.full((x.shape[0], self.out_sz), 3.0, dtype=x.dtype), None
+            assert x.shape == (routed_out.shape[0], self.part_in)
+            return x @ self.weight_kn, None
 
     class FakeSharedMLP(nn.Module):
         def __init__(self, *args, **kwargs) -> None:
@@ -2932,7 +2947,7 @@ def test_kimi_moe_fuses_tp_row_parallel_up_proj_and_shared_all_reduce(
             self.reduce_results = kwargs["reduce_results"]
 
         def forward(self, x: torch.Tensor, sequence_parallel: bool = False):
-            return torch.full_like(x, 5.0)
+            return torch.full_like(x, 1.25)
 
     fused_kwargs: dict[str, object] = {}
 
@@ -2943,13 +2958,16 @@ def test_kimi_moe_fuses_tp_row_parallel_up_proj_and_shared_all_reduce(
             self.moe_config = SimpleNamespace()
 
         def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
-            return torch.ones((hidden_states.shape[0], 8), dtype=hidden_states.dtype)
+            return routed_out
 
     def fake_factory(**kwargs):
         fused_kwargs.update(kwargs)
         return FakeRunner()
 
-    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size", lambda: tp_size)
+    monkeypatch.setattr(
+        kimi_moe, "get_tensor_model_parallel_rank", lambda: current_tp_rank
+    )
     monkeypatch.setattr(kimi_moe, "tensor_model_parallel_all_reduce", fake_all_reduce)
     monkeypatch.setattr(kimi_moe, "GateLinear", FakeGate)
     monkeypatch.setattr(kimi_moe, "RowParallelLinear", FakeRowParallel)
@@ -2959,23 +2977,31 @@ def test_kimi_moe_fuses_tp_row_parallel_up_proj_and_shared_all_reduce(
     monkeypatch.setattr(kimi_moe, "FusedMoEFactory", fake_factory)
 
     config = KimiLinearConfig(
-        hidden_size=16,
+        hidden_size=hidden_size,
         num_experts=4,
         num_experts_per_token=2,
         moe_intermediate_size=512,
         num_shared_experts=2,
-        routed_expert_hidden_size=8,
+        routed_expert_hidden_size=expert_hidden,
         latent_moe_use_norm=True,
     )
     qcfg = kimi_moe.VllmUnquantizedConfig()
-    layer = kimi_moe.KimiMoE(config, quant_config=qcfg, prefix="model.layers.1.block_sparse_moe")
-    assert layer._fuse_tp_up_proj is True
-    assert isinstance(layer.gate.quant_config, kimi_moe.VllmUnquantizedConfig)
-    assert isinstance(layer.routed_expert_up_proj, FakeRowParallel)
-    assert layer.routed_expert_up_proj.reduce_results is False
-    assert fused_kwargs["shared_experts"] is None
-    assert fused_kwargs["routed_output_transform"] is None
+    partials: list[torch.Tensor] = []
+    for r in range(tp_size):
+        current_tp_rank = r
+        layer = kimi_moe.KimiMoE(
+            config, quant_config=qcfg, prefix="model.layers.1.block_sparse_moe"
+        )
+        layer.process_weights_after_loading()
+        assert layer._fuse_tp_up_proj is True
+        assert isinstance(layer.gate.quant_config, kimi_moe.VllmUnquantizedConfig)
+        assert isinstance(layer.routed_expert_up_proj, FakeRowParallel)
+        assert layer.routed_expert_up_proj.reduce_results is False
+        assert fused_kwargs["shared_experts"] is None
+        assert fused_kwargs["routed_output_transform"] is None
+        partials.append(layer(torch.zeros((3, hidden_size), dtype=torch.bfloat16)))
 
-    out = layer(torch.zeros((3, 16), dtype=torch.bfloat16))
-    assert len(all_reduces) == 1
-    torch.testing.assert_close(out, torch.full((3, 16), 16.0, dtype=torch.bfloat16))
+    assert len(all_reduces) == tp_size
+    summed = torch.stack(partials, dim=0).sum(dim=0)
+    expected = routed_out @ full_up_w.t() + (1.25 * tp_size)
+    torch.testing.assert_close(summed, expected, atol=5e-2, rtol=2e-2)
