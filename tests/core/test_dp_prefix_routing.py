@@ -225,6 +225,20 @@ class TestDPPrefixDirectory(unittest.TestCase):
         self.assertEqual(client.get_core_engine_for_request(req_pinned), "e1")
         self.assertEqual(req_pinned.data_parallel_rank, 1)
 
+        # Unpinned request goes through cache-aware routing, increments local
+        # lb_engines waiting count, and rotates eng_start_index.
+        req_auto = SimpleNamespace(
+            data_parallel_rank=None,
+            resumable=False,
+            request_id="r2",
+            prompt_token_ids=list(range(5000, 7048)),
+        )
+        chosen = client.get_core_engine_for_request(req_auto)
+        self.assertEqual(chosen, "e0")
+        self.assertIsNone(req_auto.data_parallel_rank)
+        self.assertEqual(client.lb_engines[0][0], 1)
+        self.assertEqual(client.eng_start_index, 1)
+
     def test_cold_prefill_backlog_spreads_80k_arrivals_while_warm_sticks(self):
         directory = _DPPrefixDirectory(num_engines=4, chunk_tokens=512)
         cold_0 = [10_000 + i for i in range(81_920)]

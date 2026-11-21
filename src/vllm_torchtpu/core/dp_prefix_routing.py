@@ -295,6 +295,21 @@ def patch_dp_prefix_routing() -> None:
         finally:
             request.data_parallel_rank = None
         actual_idx = self._tpu_eng_to_idx.get(engine, chosen_idx)
+        # original() skips DPLBAsyncMPClient's local queue update and scan-start
+        # rotation when request.data_parallel_rank is set; apply both here so
+        # burst arrivals between 100ms coordinator updates see balanced queues
+        # and unbiased tie-breaking.
+        if 0 <= actual_idx < len(self.lb_engines):
+            entry = self.lb_engines[actual_idx]
+            if isinstance(entry, list):
+                entry[0] += self.client_count
+            elif isinstance(entry, tuple) and len(entry) == 3:
+                self.lb_engines[actual_idx] = (
+                    entry[0] + self.client_count,
+                    entry[1],
+                    entry[2],
+                )
+        self.eng_start_index = (self.eng_start_index + 1) % len(self.core_engines)
         directory.record(
             digests, actual_idx, prompt_len=len(request.prompt_token_ids)
         )

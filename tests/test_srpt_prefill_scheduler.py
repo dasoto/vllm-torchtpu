@@ -900,3 +900,43 @@ def test_tpu_runner_any_decode_enabled_by_cadence_no_escape(monkeypatch):
     assert not runner._any_decode(SimpleNamespace(num_scheduled_tokens={}))
     assert not runner._any_decode(SimpleNamespace(num_scheduled_tokens={"pref_r": 32}))
     assert runner._any_decode(SimpleNamespace(num_scheduled_tokens={"dec_r": 1}))
+
+
+def test_progress_when_cache_block_size_exceeds_chunk_budget(shared_model_config):
+    """When DCP / hybrid unified pooling scales cache_config.block_size above
+    max_num_batched_tokens, chunks getting their full budget must not be
+    falsely marked stalled after max_consecutive_holds steps."""
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        num_blocks=64,
+        max_num_seqs=8,
+        max_num_batched_tokens=16,
+    )
+    scheduler.max_consecutive_holds = 2
+    scheduler.cache_config.block_size = 64  # > max_num_batched_tokens (16)
+
+    req_long = _running_long_prefill(scheduler, hasher, num_tokens=160)
+    # Advance two full 16-token chunks: must NOT accumulate _stalled_steps.
+    for _ in range(2):
+        out = scheduler.schedule()
+        assert out.num_scheduled_tokens.get("long") == 16
+    assert scheduler._stalled_steps.get("long", 0) == 0
+
+    # A short waiting arrival can still hold `long` because `long` is not stalled.
+    scheduler.add_request(_make_real_request("short_1", 16, hasher, seed=11))
+    out = scheduler.schedule()
+    assert "short_1" in out.num_scheduled_tokens
+    assert "long" not in out.num_scheduled_tokens
+
+    # After 2 consecutive holds (`max_consecutive_holds=2`), anti-starvation kicks in.
+    scheduler.add_request(_make_real_request("short_2", 16, hasher, seed=12))
+    out = scheduler.schedule()
+    assert "short_2" in out.num_scheduled_tokens
+    assert "long" not in out.num_scheduled_tokens
+    assert scheduler._is_stalled(req_long)
+
+    scheduler.add_request(_make_real_request("short_3", 16, hasher, seed=13))
+    out = scheduler.schedule()
+    assert "long" in out.num_scheduled_tokens
+    assert not scheduler._is_stalled(req_long)
+

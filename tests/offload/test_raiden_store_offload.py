@@ -4364,6 +4364,20 @@ class TestDivergedHybridHitLookup(unittest.TestCase):
         self._seed(self.MAMBA, 2)
         self.assertEqual(self._hit(), 2 * self.BLOCK)
 
+    def test_local_hit_touches_resident_prefix_in_host_lru(self):
+        # Local HBM hit covers chunk 0 (self.LOCAL == 1 * self.BLOCK); host
+        # pool also holds chunk 0 from an earlier offload. Admission must touch
+        # chunk 0 so active multi-turn sessions do not lose early prefix chunks
+        # to FIFO eviction in the Raiden host store.
+        self._seed(self.ATTN, 0, 1)
+        self._seed(self.MAMBA, 0, 1)
+        self.store.calls.clear()
+        self.assertEqual(self._hit(), self.BLOCK)
+        released = [c.args[0] for c in self.store.calls_named("release")]
+        self.assertIn(sub_hashes(self._key(self.ATTN, 0)), released)
+        self.assertIn(sub_hashes(self._key(self.MAMBA, 0)), released)
+        self.assertEqual(self.store.pinned_hashes(), {})
+
 
 class TestDenseDpIndex(unittest.TestCase):
     """Dense (non-MoE) DP>1: vLLM's EngineCore resets

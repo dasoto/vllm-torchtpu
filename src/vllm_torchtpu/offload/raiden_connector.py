@@ -218,6 +218,41 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
 
+    def get_num_new_matched_tokens(
+        self,
+        request,
+        num_computed_tokens: int,
+        max_num_new_tokens: int | None = None,
+    ) -> tuple[int | None, bool]:
+        res = super().get_num_new_matched_tokens(
+            request, num_computed_tokens, max_num_new_tokens
+        )
+        # Upstream OffloadingConnectorScheduler skips local HBM-hit chunks in
+        # _lookup and never calls manager.touch(), leaving early prefix chunks
+        # of active multi-turn sessions at the tail of Raiden's host LRU.
+        # Refresh resident host-pool entries covering the local hit once
+        # admission settles (res[0] is not None), inside the step lock opened
+        # by super().get_num_new_matched_tokens().
+        if (
+            res[0] is not None
+            and num_computed_tokens > 0
+            and not request.skip_reading_prefix_cache
+        ):
+            req_status = self._req_status.get(request.request_id)
+            if req_status is not None:
+                local_keys: list[OffloadKey] = []
+                for group_config, group_state in zip(
+                    self.config.kv_group_configs, req_status.group_states
+                ):
+                    n_local_chunks = (
+                        num_computed_tokens // group_config.tokens_per_chunk
+                    )
+                    if n_local_chunks > 0:
+                        local_keys.extend(group_state.offload_keys[:n_local_chunks])
+                if local_keys:
+                    self._raiden_manager.touch(local_keys, req_status.req_context)
+        return res
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
