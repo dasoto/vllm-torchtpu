@@ -940,3 +940,92 @@ def test_progress_when_cache_block_size_exceeds_chunk_budget(shared_model_config
     assert "long" in out.num_scheduled_tokens
     assert not scheduler._is_stalled(req_long)
 
+
+def test_connector_scheduler_partial_tail_alignment_and_hbm_headroom_promotion(
+    shared_model_config, monkeypatch
+):
+    """Verify connector_scheduler partial-tail hash alignment, hard-starvation
+    tier ordering, and non-head-of-line HBM admission under full-ISL reservation."""
+    monkeypatch.setenv("VLLM_TPU_SRPT_PROMOTE_WARM_WAITING", "1")
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        num_blocks=10,  # 9 usable KV blocks (block 0 is null)
+        max_num_seqs=8,
+        max_num_batched_tokens=64,
+        scheduler_reserve_full_isl=True,
+    )
+    stub_conn = SimpleNamespace(
+        connector_scheduler=SimpleNamespace(
+            config=SimpleNamespace(
+                supports_partial_tail=True,
+                tokens_per_hash=BLOCK_SIZE,
+                alignment_tokens=4 * BLOCK_SIZE,
+            )
+        ),
+        supports_divergent_local_hybrid_hits=False,
+        requires_kv_delivery=False,
+        on_new_request=lambda req: None,
+        get_num_new_matched_tokens=lambda req, n: (0, False),
+        update_state_after_alloc=lambda req, blocks, n: None,
+        build_connector_meta=lambda out: None,
+        request_finished=lambda req, block_ids: (False, None),
+        has_connector_metadata=lambda: False,
+        has_pending_block_frees=lambda: False,
+        has_pending_push_work=lambda: False,
+        reset_cache=lambda: True,
+        get_external_cache_hit_sources=lambda req_ids: {},
+    )
+    scheduler.connector = stub_conn
+    seed_req = _make_real_request("seed_pt", 3 * BLOCK_SIZE, hasher, seed=501)
+    scheduler.add_request(seed_req)
+    scheduler.schedule()
+    scheduler.connector = None
+    scheduler.finish_requests("seed_pt", RequestStatus.FINISHED_ABORTED)
+    scheduler.schedule()
+    assert scheduler.reset_prefix_cache(reset_connector=False) is True
+    scheduler.connector = stub_conn
+
+    followup = _make_real_request(
+        "followup_pt",
+        4 * BLOCK_SIZE,
+        hasher,
+        seed=502,
+        shared_prefix=list(seed_req.prompt_token_ids),
+    )
+    # With supports_partial_tail=True, 3 * BLOCK_SIZE (48) stays 48 instead of 0.
+    assert scheduler._estimated_prefix_hit_tokens(followup) == 3 * BLOCK_SIZE
+    scheduler.connector = None
+
+    # Now occupy 5 of the 9 usable KV blocks with an active request, leaving 4 free.
+    active = _make_real_request("active", 5 * BLOCK_SIZE, hasher, seed=503)
+    scheduler.add_request(active)
+    out = scheduler.schedule()
+    assert "active" in out.num_scheduled_tokens
+
+    # Enqueue an oversize request (needs 6 blocks > 4 free) ahead of a fitting
+    # request (needs 3 blocks <= 4 free). Without HBM-headroom promotion,
+    # waiting[0] (`oversize`) would fail allocate_slots and `break`, admitting nothing.
+    oversize = _make_real_request("oversize", 6 * BLOCK_SIZE, hasher, seed=504)
+    fitting = _make_real_request("fitting", 3 * BLOCK_SIZE, hasher, seed=505)
+    scheduler.add_request(oversize)
+    scheduler.add_request(fitting)
+
+    out2 = scheduler.schedule()
+    assert "fitting" in out2.num_scheduled_tokens
+    assert "oversize" not in out2.num_scheduled_tokens
+
+    # Also verify hard-starvation tier (-1) orders a >600s aged request ahead of
+    # a newly arrived short request when both fit in free HBM blocks.
+    scheduler.finish_requests(
+        ["active", "fitting", "oversize"], RequestStatus.FINISHED_ABORTED
+    )
+    scheduler.schedule()
+    aged_long = _make_real_request("aged_long", 4 * BLOCK_SIZE, hasher, seed=506)
+    aged_long.arrival_time -= 700.0
+    fresh_short = _make_real_request("fresh_short", BLOCK_SIZE, hasher, seed=507)
+    scheduler.add_request(fresh_short)
+    scheduler.add_request(aged_long)
+    scheduler._maybe_promote_warm_waiting()
+    assert list(scheduler.waiting)[0].request_id == "aged_long"
+
+

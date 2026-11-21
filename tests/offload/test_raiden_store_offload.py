@@ -4425,5 +4425,157 @@ class TestDenseDpIndex(unittest.TestCase):
         self.assertEqual(job_name, "vllm-offload-engine-dp2")
 
 
+class TestDcpPartialTailRecall(unittest.TestCase):
+    """Under DCP > 1 (e.g. DCP=8 -> tokens_per_block=13312, tokens_per_hash=1664),
+    TPURaidenOffloadingScheduler enables supports_partial_tail because Raiden
+    transfers opaque whole physical KV blocks rank-for-rank across DCP workers."""
+
+    ATTN = 0
+    MAMBA = 1
+    HASH_BLOCK = 1664
+    DCP_SIZE = 8
+    DCP_BLOCK = HASH_BLOCK * DCP_SIZE  # 13,312
+
+    def setUp(self):
+        import torch
+        from vllm import SamplingParams
+        from vllm.utils.hashing import sha256
+        from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+        from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
+        from vllm.v1.kv_cache_interface import (
+            FullAttentionSpec,
+            KVCacheConfig,
+            KVCacheGroupSpec,
+            MambaSpec,
+        )
+        from vllm.v1.kv_offload.base import OffloadingKVEventsConfig
+        from vllm.v1.request import Request
+
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
+
+        _isolate_storage_env(self)
+        self.store = FakeKVCacheStore()
+        self.manager = make_manager(self.store)
+        attn = FullAttentionSpec(
+            block_size=self.HASH_BLOCK,
+            num_kv_heads=1,
+            head_size=8,
+            dtype=torch.bfloat16,
+        )
+        mamba = MambaSpec(
+            block_size=self.DCP_BLOCK,
+            shapes=((2, 8),),
+            dtypes=(torch.bfloat16,),
+            mamba_cache_mode="align",
+        )
+        kv_cache_config = KVCacheConfig(
+            num_blocks=64,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["attn"], attn),
+                KVCacheGroupSpec(["kda"], mamba),
+            ],
+            cache_hit_alignment_tokens=self.HASH_BLOCK,
+        )
+        spec = SimpleNamespace(
+            config=SimpleNamespace(
+                groups=[
+                    SimpleNamespace(
+                        group_id=self.ATTN,
+                        tokens_per_block=self.DCP_BLOCK,
+                        sliding_window_size_in_chunks=None,
+                    ),
+                    SimpleNamespace(
+                        group_id=self.MAMBA,
+                        tokens_per_block=self.DCP_BLOCK,
+                        sliding_window_size_in_chunks=1,
+                    ),
+                ]
+            ),
+            blocks_per_chunk=1,
+            tokens_per_block=[self.DCP_BLOCK, self.DCP_BLOCK],
+            tokens_per_hash=self.HASH_BLOCK,
+            offload_prompt_only=False,
+            extra_config={},
+            kv_events_config=OffloadingKVEventsConfig(
+                enable_kv_cache_events=False, self_describing_kv_events=False
+            ),
+            get_manager=lambda: self.manager,
+        )
+        vllm_config = SimpleNamespace(
+            cache_config=SimpleNamespace(
+                prefix_cache_retention_interval=self.DCP_BLOCK,
+                enable_prefix_caching=True,
+            ),
+            speculative_config=None,
+            parallel_config=SimpleNamespace(
+                world_size=self.DCP_SIZE,
+                decode_context_parallel_size=self.DCP_SIZE,
+            ),
+        )
+        register_all_kvcache_specs(vllm_config)
+        self.scheduler = TPURaidenOffloadingScheduler(
+            spec, vllm_config, kv_cache_config
+        )
+        init_none_hash(sha256)
+        params = SamplingParams(max_tokens=1)
+        params.update_from_generation_config({}, 2)
+        # 33,280 tokens = 2 * 13,312 + 4 * 1,664; last Mamba boundary < 33,280 is 31,616.
+        self.prompt_len = 33280
+        self.tail_boundary = 31616
+        self.request = Request(
+            "req_dcp",
+            list(range(self.prompt_len)),
+            params,
+            None,
+            block_hasher=get_request_block_hasher(self.HASH_BLOCK, sha256),
+        )
+        self.scheduler.on_new_request(self.request)
+
+    def _hash_key(self, group: int, token_boundary: int):
+        from vllm.v1.kv_offload.base import make_offload_key
+
+        hash_idx = token_boundary // self.HASH_BLOCK - 1
+        return make_offload_key(self.request.block_hashes[hash_idx], group)
+
+    def test_dcp_enables_partial_tail_and_recalls_1664_aligned_boundary(self):
+        from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+        from vllm.v1.core.kv_cache_utils import KVCacheBlock
+
+        self.assertTrue(self.scheduler.config.supports_partial_tail)
+        self.assertEqual(self.scheduler._partial_tail_block_size, self.DCP_BLOCK)
+
+        # Seed complete chunks 13,312 and 26,624 plus partial-tail 31,616 in host DRAM.
+        for boundary in (self.DCP_BLOCK, 2 * self.DCP_BLOCK, self.tail_boundary):
+            seed_host_entries(self.store, self._hash_key(self.ATTN, boundary))
+            seed_host_entries(self.store, self._hash_key(self.MAMBA, boundary))
+
+        hit, load_async = self.scheduler.get_num_new_matched_tokens(self.request, 0)
+        self.assertEqual(hit, self.tail_boundary)
+        self.assertTrue(load_async)
+
+        # Allocate 3 attention blocks (covering 31,616 tokens) and 3 Mamba blocks
+        # (2 retired nulls + 1 fresh state block at index 2).
+        attn_blocks = [KVCacheBlock(101), KVCacheBlock(102), KVCacheBlock(103)]
+        mamba_blocks = [KVCacheBlock(0), KVCacheBlock(0), KVCacheBlock(203)]
+        mamba_blocks[0].is_null = True
+        mamba_blocks[1].is_null = True
+        self.scheduler.update_state_after_alloc(
+            self.request,
+            KVCacheBlocks(blocks=(attn_blocks, mamba_blocks)),
+            self.tail_boundary,
+        )
+        (job,) = self.scheduler._current_batch_load_jobs.values()
+        self.assertEqual(list(job.dst_spec.block_ids), [101, 102, 103, 203])
+        (status,) = self.scheduler._jobs.values()
+        expected_keys = {
+            self._hash_key(self.ATTN, self.DCP_BLOCK),
+            self._hash_key(self.ATTN, 2 * self.DCP_BLOCK),
+            self._hash_key(self.ATTN, self.tail_boundary),
+            self._hash_key(self.MAMBA, self.tail_boundary),
+        }
+        self.assertEqual(status.keys, expected_keys)
+
+
 if __name__ == "__main__":
     unittest.main()

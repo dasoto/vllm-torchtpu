@@ -91,6 +91,8 @@ _MAX_BACKOFF_SHIFT = 6
 _ATTN_CAP_LOG_EVERY = 10000
 _WARM_WINDOW = 128
 _WARM_STARVATION_SECONDS = 90.0
+_HARD_STARVATION_SECONDS = 600.0
+_CRITICAL_HOLD_SECONDS = 900.0
 _WARM_FOLLOWUP_MIN_HIT_TOKENS = 8192
 _WARM_FOLLOWUP_MAX_UNCACHED_TOKENS = 32768
 _MAX_EXTERNAL_BLOCK_HASHES = 65536
@@ -187,12 +189,36 @@ class SrptPrefillScheduler(AsyncScheduler):
             matched_blocks * tokens_per_hash,
             max(request.num_prompt_tokens - 1, 0),
         )
-        conn_sched = getattr(self.connector, "_scheduler", None)
+        conn_sched = getattr(self.connector, "connector_scheduler", None) or getattr(
+            self.connector, "_scheduler", None
+        )
         conn_cfg = getattr(conn_sched, "config", None)
-        align = getattr(conn_cfg, "alignment_tokens", None)
+        if getattr(conn_cfg, "supports_partial_tail", False):
+            align = getattr(conn_cfg, "tokens_per_hash", None)
+        else:
+            align = getattr(conn_cfg, "alignment_tokens", None)
         if isinstance(align, int) and align > 0:
             ext_tokens = (ext_tokens // align) * align
         return max(local_hit_tokens, ext_tokens)
+
+    def _waiting_req_fits_kv(self, request: Request, avail_blocks: int) -> bool:
+        """Whether ``avail_blocks`` can admit ``request`` under full-ISL reservation."""
+        if not self.scheduler_reserve_full_isl:
+            return True
+        hit_blocks, hit_tokens = self._prefix_hit(request)
+        full_num_tokens = min(request.num_tokens, self.max_model_len)
+        needed = self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
+            request_id=request.request_id,
+            num_tokens=full_num_tokens,
+            new_computed_blocks=hit_blocks.blocks,
+            num_encoder_tokens=0,
+            total_computed_tokens=hit_tokens,
+            num_local_computed_tokens=hit_tokens,
+            num_tokens_main_model=full_num_tokens,
+            apply_admission_cap=True,
+            prefill_end=max(request.num_prompt_tokens, request.num_tokens - 1),
+        )
+        return needed <= avail_blocks
 
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
@@ -223,19 +249,32 @@ class SrptPrefillScheduler(AsyncScheduler):
         now = time.time()
         kv_fetch_stages = getattr(self, "_kv_fetch_stages", None) or {}
         has_inflight_prefills = bool(getattr(self, "_inflight_prefills", None))
-        key_cache: dict[str, tuple[int, int, int, float]] = {}
+        avail_blocks = 0
+        if self.scheduler_reserve_full_isl:
+            reserved = (
+                self._inflight_prefill_reserved_blocks() + self._spec_decode_step_blocks
+            )
+            if self.running:
+                reserved += self.kv_cache_manager.watermark_blocks
+            avail_blocks = max(
+                self.kv_cache_manager.block_pool.get_num_free_blocks() - reserved, 0
+            )
+        key_cache: dict[str, tuple[int, int, int, float, float]] = {}
 
-        def rank_key(req: Request) -> tuple[int, int, int, float]:
+        def rank_key(req: Request) -> tuple[int, int, int, float, float]:
             cached_key = key_cache.get(req.request_id)
             if cached_key is not None:
                 return cached_key
             est_hit = self._estimated_prefix_hit_tokens(req)
             uncached = max(req.num_tokens - est_hit, 0)
+            wait_s = now - req.arrival_time
             is_stalled_fetch = kv_fetch_stages.get(req) == KV_FETCH_WAITING_TO_START
-            if not is_stalled_fetch and (
+            if not is_stalled_fetch and wait_s > _HARD_STARVATION_SECONDS:
+                tier = -1
+            elif not is_stalled_fetch and (
                 req.num_preemptions > 0
                 or uncached <= 8192
-                or (now - req.arrival_time) > _WARM_STARVATION_SECONDS
+                or wait_s > _WARM_STARVATION_SECONDS
             ):
                 tier = 0
             elif (
@@ -246,18 +285,41 @@ class SrptPrefillScheduler(AsyncScheduler):
                 tier = 1
             else:
                 tier = 2
+            # Upstream Scheduler.schedule() executes `break` (head-of-line block)
+            # when waiting[0] fails full-ISL KV allocation. Demote non-critical
+            # requests whose full ISL exceeds free HBM blocks behind ready
+            # requests that DO fit, while letting critically aged requests hold
+            # the head of the queue so HBM blocks drain for them before timeout.
+            exceeds_hbm = (
+                1
+                if (
+                    self.scheduler_reserve_full_isl
+                    and wait_s <= _CRITICAL_HOLD_SECONDS
+                    and not self._waiting_req_fits_kv(req, avail_blocks)
+                )
+                else 0
+            )
             # Always let urgent/warm hits jump ahead of a stalled async fetch.
             # Only let cold long prefills jump ahead of a stalled async fetch
             # when no in-flight prefill is currently running.
             demote_stalled_cold = (
                 1 if (is_stalled_fetch and not has_inflight_prefills) else 0
             )
-            res = (tier, demote_stalled_cold, uncached, req.arrival_time)
+            primary_metric = req.arrival_time if tier == -1 else float(uncached)
+            res = (
+                exceeds_hbm,
+                tier,
+                demote_stalled_cold,
+                primary_metric,
+                req.arrival_time,
+            )
             key_cache[req.request_id] = res
             return res
 
         queue = cast(FCFSRequestQueue, self.waiting)
-        promotable = [r for r in ready if rank_key(r)[0] < 2]
+        promotable = [
+            r for r in ready if rank_key(r)[0] == 0 and rank_key(r)[1] < 2
+        ]
         if promotable:
             ordered = sorted(promotable, key=rank_key)
             if ready[: len(ordered)] != ordered:

@@ -218,6 +218,60 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
 
+        # Upstream OffloadingConnectorScheduler disables supports_partial_tail
+        # whenever decode_context_parallel_size > 1 because CPU canonical-layout
+        # workers de-interleave token positions across DCP shards. In contrast,
+        # TPURaidenOffloadingConnector transfers opaque whole physical KV blocks
+        # rank-for-rank across all DCP workers (get_required_kvcache_layout -> None),
+        # so DCP-sharded full-attention blocks plus Mamba CoW boundary blocks at
+        # hash-aligned interior positions preserve exact per-rank KV layout.
+        group_block_sizes = {c.tokens_per_block for c in self.config.kv_group_configs}
+        has_partial_recurrent_group = any(
+            c.requires_cow_source and c.tokens_per_block > self.config.tokens_per_hash
+            for c in self.config.kv_group_configs
+        )
+        if (
+            not self.config.supports_partial_tail
+            and self.config.dcp_world_size > 1
+            and self.config.blocks_per_chunk == 1
+            and len(group_block_sizes) == 1
+            and has_partial_recurrent_group
+            and all(
+                c.sliding_window_size_in_chunks is None or c.requires_cow_source
+                for c in self.config.kv_group_configs
+            )
+        ):
+            from vllm.v1.core.kv_cache_coordinator import eagle_proof_margin
+
+            self.config = self.config._replace(supports_partial_tail=True)
+            self._partial_tail_block_size = (
+                self.config.kv_group_configs[0].tokens_per_block
+            )
+            alignment = kv_cache_config.cache_hit_alignment_tokens
+            partial_hash_hits = (
+                alignment is not None and alignment < self._partial_tail_block_size
+            )
+            self._eagle_proof_margins = {
+                c.group_idx: eagle_proof_margin(
+                    self._partial_tail_block_size,
+                    self.config.tokens_per_hash,
+                    partial_hash_hits
+                    and c.manager_cls.supports_fine_grained_hash_lookup,
+                )
+                for c in self.config.kv_group_configs
+                if c.is_eagle_group and not c.requires_cow_source
+            }
+            self._max_eagle_proof_margin = max(
+                self._eagle_proof_margins.values(), default=0
+            )
+            logger.info(
+                "TPURaidenOffloadingScheduler: enabled supports_partial_tail "
+                "under DCP=%d (partial_tail_block_size=%d, tokens_per_hash=%d).",
+                self.config.dcp_world_size,
+                self._partial_tail_block_size,
+                self.config.tokens_per_hash,
+            )
+
     def get_num_new_matched_tokens(
         self,
         request,
@@ -241,6 +295,12 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             req_status = self._req_status.get(request.request_id)
             if req_status is not None:
                 local_keys: list[OffloadKey] = []
+                has_local_partial_tail = (
+                    self.config.supports_partial_tail
+                    and self._partial_tail_block_size > 0
+                    and num_computed_tokens % self._partial_tail_block_size != 0
+                    and num_computed_tokens % self.config.tokens_per_hash == 0
+                )
                 for group_config, group_state in zip(
                     self.config.kv_group_configs, req_status.group_states
                 ):
@@ -249,6 +309,19 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                     )
                     if n_local_chunks > 0:
                         local_keys.extend(group_state.offload_keys[:n_local_chunks])
+                    if has_local_partial_tail:
+                        key_tokens = self._partial_tail_key_tokens(
+                            group_config, num_computed_tokens
+                        )
+                        if key_tokens <= len(request.block_hashes) * self.config.tokens_per_hash:
+                            local_keys.append(
+                                self._make_boundary_key(
+                                    request,
+                                    group_config.group_idx,
+                                    key_tokens,
+                                    req_status.req_context,
+                                )
+                            )
                 if local_keys:
                     self._raiden_manager.touch(local_keys, req_status.req_context)
         return res
