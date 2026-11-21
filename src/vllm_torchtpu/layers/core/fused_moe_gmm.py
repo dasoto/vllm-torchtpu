@@ -502,9 +502,36 @@ def prepare_routed_gmm_inputs(
             # expert prefix through SparseCore ragged_gather. Invalid
             # non-local rows are sorted after the valid prefix.
             valid_count = group_sizes_local.sum(dtype=jnp.int32)
+            gather_indices = token_indices_sorted
+            if (
+                local_num_experts < topk
+                and ragged_gather_reduce is ragged_gather_reduce_v2
+            ):
+                # Each token selects `topk` distinct experts, so at most
+                # `local_num_experts` routes per token can land on this EP shard.
+                # Bounding the gathered/GMM rows at that exact ceiling (aligned
+                # to SparseCore's ragged_gather_v2 block size so out_pad_size==0)
+                # cuts `x`, `gmm1_res`, and `gmm2_res` HBM by
+                # `topk / local_num_experts` (2.29x on Kimi-K3.1 EP=128) with
+                # zero approximation.
+                raw_cap = num_tokens_local * local_num_experts
+                sc_info = get_sparse_core_info()
+                align = 256
+                if sc_info is not None:
+                    base_block = (
+                        sc_info.num_lanes * sc_info.num_cores * sc_info.num_subcores
+                    )
+                    subchunks = max(
+                        1, min(4, (raw_cap + base_block - 1) // base_block)
+                    )
+                    align = max(align, base_block * subchunks)
+                max_routes = min(
+                    gather_indices.shape[0], ((raw_cap + align - 1) // align) * align
+                )
+                gather_indices = gather_indices[:max_routes]
             x = ragged_gather_v2(
                 hidden_states_local,
-                token_indices_sorted,
+                gather_indices,
                 jnp.array([0], dtype=jnp.int32),
                 valid_count[None],
             )
@@ -673,9 +700,14 @@ def moe_gmm(
                 axis=1
             )
             return (combine @ gmm2_res).astype(x.dtype)
+        combine_indices = (
+            jnp.minimum(argsort_revert_indices, gmm2_res.shape[0] - 1)
+            if gmm2_res.shape[0] < argsort_revert_indices.size
+            else argsort_revert_indices
+        )
         return ragged_gather_reduce(
             gmm2_res,
-            argsort_revert_indices,
+            combine_indices,
             topk_weights_flat,
             valid_mask_flat,
             reduce_group_size=topk,

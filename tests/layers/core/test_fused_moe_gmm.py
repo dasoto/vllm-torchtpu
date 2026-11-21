@@ -1518,3 +1518,137 @@ def test_prepare_routed_counting_sort_env_gate_restores_sorts(
     assert num_sorts == expected_sorts, (
         f"Expected {expected_sorts} comparison sort ops, got {num_sorts}"
     )
+
+
+def test_ep_ragged_permute_caps_gmm_rows_at_local_expert_bound(monkeypatch):
+    """When local_num_experts < topk (e.g. Kimi-K3.1 EP=128: 7 < 16), bounded
+    gather/GMM rows match uncapped execution bit-for-bit including when every
+    token routes to all 7 local experts simultaneously."""
+    num_tokens, topk, local_num_experts, hidden, inter = 64, 16, 7, 16, 16
+    k_h, k_w1, k_w2, k_tw = jax.random.split(jax.random.key(99), 4)
+    hidden_states = jax.random.normal(k_h, (num_tokens, hidden), dtype=jnp.bfloat16)
+    w1 = jax.random.normal(
+        k_w1, (local_num_experts, hidden, 2 * inter), dtype=jnp.bfloat16
+    )
+    w2 = jax.random.normal(k_w2, (local_num_experts, inter, hidden), dtype=jnp.bfloat16)
+    # Worst-case stress: every token selects all 7 local experts (slots 0..6)
+    # plus 9 non-local experts (-1), hitting the exact 64 * 7 = 448 ceiling.
+    local_slots = jnp.broadcast_to(
+        jnp.arange(local_num_experts, dtype=jnp.int32), (num_tokens, local_num_experts)
+    )
+    nonlocal_slots = jnp.full(
+        (num_tokens, topk - local_num_experts), -1, dtype=jnp.int32
+    )
+    topk_indices = jnp.concatenate([local_slots, nonlocal_slots], axis=-1)
+    topk_weights = jax.random.uniform(
+        k_tw, (num_tokens, topk), minval=0.01, maxval=0.2, dtype=jnp.bfloat16
+    )
+
+    from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2 import (
+        wrapper as rgr_v2_wrapper,
+    )
+
+    monkeypatch.setattr(
+        rgr_v2_wrapper.pltpu,
+        "get_tpu_info",
+        lambda: types.SimpleNamespace(sparse_core=None, vmem_capacity_bytes=128 << 20),
+    )
+    monkeypatch.setattr(
+        fused_moe_gmm, "ragged_gather_v2", lambda hs, idx, _off, _cnt: hs[idx]
+    )
+    monkeypatch.setattr(
+        fused_moe_gmm,
+        "ragged_gather_reduce",
+        fused_moe_gmm.ragged_gather_reduce_v2,
+    )
+
+    def ref_gmm(lhs, rhs, rhs_scale, rhs_bias, group_sizes, group_offset, **kwargs):
+        out_rows = []
+        cursor = 0
+        for g in range(rhs.shape[0]):
+            cnt = int(group_sizes[g])
+            seg = lhs[cursor : cursor + cnt].astype(jnp.float32) @ rhs[g].astype(
+                jnp.float32
+            )
+            if kwargs.get("fuse_act") == "silu":
+                gate, up = jnp.split(seg, 2, axis=-1)
+                seg = jax.nn.silu(gate) * up
+            out_rows.append(seg.astype(lhs.dtype))
+            cursor += cnt
+        valid_out = (
+            jnp.concatenate(out_rows, axis=0)
+            if out_rows
+            else jnp.zeros((0, rhs.shape[-1]), dtype=lhs.dtype)
+        )
+        pad = lhs.shape[0] - valid_out.shape[0]
+        return jnp.pad(valid_out, ((0, pad), (0, 0)))
+
+    monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", ref_gmm)
+
+    x_cap, gs_cap, rev_cap, tw_cap, vm_cap, ti_cap = prepare_routed_gmm_inputs(
+        hidden_states,
+        topk_indices,
+        topk_weights,
+        local_num_experts=local_num_experts,
+        topk=topk,
+        use_ep=True,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=0,
+    )
+    # 64 * 7 = 448 -> aligned up to 512 (< 64 * 16 = 1024).
+    assert x_cap.shape == (512, hidden)
+    out_cap = moe_gmm(
+        x_cap,
+        w1,
+        None,
+        None,
+        w2,
+        None,
+        None,
+        gs_cap,
+        rev_cap,
+        tw_cap,
+        vm_cap,
+        ti_cap,
+        activation="silu",
+        num_tokens=num_tokens,
+        topk=topk,
+        use_ep=True,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=0,
+    )
+
+    # Compare against uncapped plain-gather reference.
+    x_ref, gs_ref, rev_ref, tw_ref, vm_ref, ti_ref = prepare_routed_gmm_inputs(
+        hidden_states,
+        topk_indices,
+        topk_weights,
+        local_num_experts=local_num_experts,
+        topk=topk,
+        use_ep=True,
+        use_sparse_core=False,
+        onehot_moe_permute_threshold=0,
+    )
+    assert x_ref.shape == (num_tokens * topk, hidden)
+    out_ref = moe_gmm(
+        x_ref,
+        w1,
+        None,
+        None,
+        w2,
+        None,
+        None,
+        gs_ref,
+        rev_ref,
+        tw_ref,
+        vm_ref,
+        ti_ref,
+        activation="silu",
+        num_tokens=num_tokens,
+        topk=topk,
+        use_ep=True,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=0,
+    )
+    np.testing.assert_array_equal(np.asarray(out_cap), np.asarray(out_ref))
+
