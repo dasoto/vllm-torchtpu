@@ -137,7 +137,7 @@ def test_calculate_tiling_v6e_fp4_prefill_uses_1024_tile_m(monkeypatch):
         prefill_dims, lhs_cfgs, rhs_cfgs, vmem_limit, fuse_act="situ:4.0:25.0"
     )
     assert prefill_tiles == TileSizes(
-        tile_m=1024, tile_k=3584, tile_n=3072, bucket_base=256
+        tile_m=1024, tile_k=3584, tile_n=3072, bucket_base=512
     )
 
     decode_dims = Dimensions(

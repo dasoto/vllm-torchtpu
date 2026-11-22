@@ -540,43 +540,23 @@ def inner_kernel(
         acc_list = []
         if not cfgs.lhs_cfgs.should_quantize:
             # Unquantized matmul path.
-            decode_e2m1_per_k_block = (
-                is_emulated_e2m1 and not cfgs.rhs_cfgs.should_dequantize_before_matmul
-            )
             for start_n in range(0, rhs_tile_n, mxu_size):
                 end_n = min(rhs_tile_n, start_n + mxu_size)
                 col_size = end_n - start_n
-                if decode_e2m1_per_k_block:
-                    strip_rhs_full = None
-                    step_rhs_qbs = rhs_qbs
-                elif is_emulated_e2m1:
-                    strip_rhs_full, step_rhs_qbs = _prepare_emulated_e2m1_strip(
+                if is_emulated_e2m1:
+                    strip_rhs, step_rhs_qbs = _prepare_emulated_e2m1_strip(
                         start_n, end_n, col_size
                     )
                 else:
-                    strip_rhs_full = tiled_rhs[:, start_n:end_n]
+                    strip_rhs = tiled_rhs[:, start_n:end_n]
                     step_rhs_qbs = rhs_qbs
 
                 acc_n = jnp.zeros((bucket_m, col_size), dtype=acc_ref.dtype)
                 for start_k in range(0, cfgs.tiles.tile_k, step_rhs_qbs):
                     end_k = min(cfgs.tiles.tile_k, start_k + step_rhs_qbs)
-                    if decode_e2m1_per_k_block:
-                        block_rhs = _decode_e2m1_u4(
-                            tiled_rhs[start_k:end_k, start_n:end_n],
-                            cfgs.lhs_cfgs.dtype,
-                        )
-                        if is_last_k_step and valid_k != 0 and end_k > valid_k:
-                            k_idx = start_k + lax.broadcasted_iota(
-                                jnp.int32, block_rhs.shape, 0
-                            )
-                            block_rhs = jnp.where(k_idx < valid_k, block_rhs, 0)
-                    else:
-                        assert strip_rhs_full is not None
-                        block_rhs = strip_rhs_full[start_k:end_k, :]
-
                     block_acc = jnp.matmul(
                         tiled_lhs[:, start_k:end_k],
-                        block_rhs,
+                        strip_rhs[start_k:end_k, :],
                         preferred_element_type=jnp.float32,
                     ).astype(acc_ref.dtype)
 
@@ -1057,19 +1037,22 @@ def calculate_tiling(
     bf16_bf16_tile_m = 128
     rhs_mod = min(pl.cdiv(16, rhs_bits), 2)
     tile_m = bf16_bf16_tile_m // rhs_mod
-    if lhs_cfgs.should_quantize:
-        tile_m *= 2
-    elif (
-        rhs_dtype == jnp.float4_e2m1fn
+    use_v6e_fp4_prefill_buckets = (
+        not lhs_cfgs.should_quantize
+        and rhs_dtype == jnp.float4_e2m1fn
         and getattr(tpu_info, "generation", 7) < 7
         and dims.size_m > 8192
-    ):
+    )
+    if lhs_cfgs.should_quantize:
+        tile_m *= 2
+    elif use_v6e_fp4_prefill_buckets:
         # On TPU < v7, float4_e2m1fn runs on the BF16 MXU after software unpack
         # rather than a 2x-throughput FP4 MXU. On large prefill batches
-        # (size_m > 8192), starting bucket_base at 256 (max tile_m = 1024 across
-        # 4 buckets) cuts expert weight HBM DMA and unpack 4x on hot shards
-        # while keeping small decode batches (size_m <= 8192) at bucket_base=64.
-        tile_m = 256
+        # (size_m > 8192), using 2 buckets [512, 1024] cuts expert weight HBM
+        # DMA and unpack 4x on hot shards while halving Pallas switch-branch
+        # instruction overlays (2 branches vs 4) so prefill + decode programs
+        # remain co-resident in HBM without PJRT eviction.
+        tile_m = 512
     tile_m = min(tile_m, dims.size_m)
 
     # To avoid stalling MXU, we add some buffer room where tile_n cannot go
@@ -1123,10 +1106,11 @@ def calculate_tiling(
             3 * rhs_weight_vmem + 2 * rhs_scale_vmem + 2 * rhs_bias_vmem
         )
 
-        # 3. Accumulator
+        # 3. Accumulator (allocated as 1 row when size_k fits in a single K tile)
         acc_cols = fuse_act_factor * tn
         acc_dtype_bytes = 2 if lhs_cfgs.quant_dtype is not None else 4
-        acc_vmem = tm * acc_cols * acc_dtype_bytes
+        acc_m = 1 if dims.size_k <= tk else tm
+        acc_vmem = acc_m * acc_cols * acc_dtype_bytes
 
         # 4. Output tile (double-buffered)
         out_dtype_bytes = jax.dtypes.itemsize_bits(lhs_cfgs.dtype) // 8
@@ -1167,7 +1151,7 @@ def calculate_tiling(
 
     # TODO(alynie, kyuyeunk): max number of bucket was choosen empiirically.
     # Revisit the value to be based on number of instruction memory size.
-    max_num_buckets = 4
+    max_num_buckets = 2 if use_v6e_fp4_prefill_buckets else 4
     bucket_base = tile_m
     for _ in range(1, max_num_buckets):
         new_tile_m = tile_m + bucket_base
