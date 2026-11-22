@@ -1713,3 +1713,60 @@ def test_ep_ragged_permute_preserves_sparsecore_vmem_threshold(monkeypatch):
     assert seen_idx_lens[-1] == 100352
 
 
+def test_ep_max_routes_override_clamps_buffers_and_overflow(monkeypatch):
+    """VLLM_TPU_MOE_EP_MAX_ROUTES caps large prefill buffers while preserving
+    the SparseCore VMEM floor on decode and clamping pathological overflow."""
+    monkeypatch.setenv("VLLM_TPU_MOE_EP_MAX_ROUTES", "81920")
+    sc_info = types.SimpleNamespace(num_lanes=8, num_cores=2, num_subcores=16)
+    tpu_info = types.SimpleNamespace(
+        chip_version=pltpu.ChipVersion.TPU_V6E,
+        sparse_core=sc_info,
+        num_lanes=128,
+        vmem_capacity_bytes=128 << 20,
+    )
+    monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info", lambda: tpu_info)
+    monkeypatch.setattr(
+        fused_moe_gmm,
+        "ragged_gather_reduce",
+        fused_moe_gmm.ragged_gather_reduce_v2,
+    )
+    seen = []
+
+    def fake_rg(hs, idx, _off, cnt):
+        seen.append((idx.shape[0], int(np.asarray(cnt)[0])))
+        return jnp.zeros((idx.shape[0], hs.shape[-1]), dtype=hs.dtype)
+
+    monkeypatch.setattr(fused_moe_gmm, "ragged_gather_v2", fake_rg)
+
+    # Decode batch (512 tokens) still preserves 6,144 VMEM floor.
+    prepare_routed_gmm_inputs(
+        jnp.zeros((512, 3584), dtype=jnp.bfloat16),
+        jnp.zeros((512, 16), dtype=jnp.int32),
+        jnp.ones((512, 16), dtype=jnp.bfloat16),
+        local_num_experts=7,
+        topk=16,
+        use_ep=True,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=0,
+    )
+    assert seen[-1][0] == 6144
+
+    # Large prefill batch (28,672 tokens) with pathological all-local routing:
+    # buffer is capped to 81,920 (vs 200,704), valid_count and group_sizes sum
+    # are safely clamped to <= 81,920.
+    _, gs, rev, _, vm, _ = prepare_routed_gmm_inputs(
+        jnp.zeros((28672, 3584), dtype=jnp.bfloat16),
+        jnp.broadcast_to(jnp.arange(16, dtype=jnp.int32) % 7, (28672, 16)),
+        jnp.ones((28672, 16), dtype=jnp.bfloat16),
+        local_num_experts=7,
+        topk=16,
+        use_ep=True,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=0,
+    )
+    assert seen[-1] == (81920, 81920)
+    assert int(gs.sum()) == 81920
+    assert bool((gs >= 0).all())
+
+
+

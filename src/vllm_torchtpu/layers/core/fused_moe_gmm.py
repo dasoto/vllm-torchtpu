@@ -516,6 +516,9 @@ def prepare_routed_gmm_inputs(
                 # `topk / local_num_experts` (2.29x on Kimi-K3.1 EP=128) with
                 # zero approximation.
                 raw_cap = num_tokens_local * local_num_experts
+                max_routes_override = envs.VLLM_TPU_MOE_EP_MAX_ROUTES
+                if max_routes_override > 0:
+                    raw_cap = min(raw_cap, max_routes_override)
                 try:
                     tpu_info = pltpu.get_tpu_info()
                 except ValueError:
@@ -547,6 +550,13 @@ def prepare_routed_gmm_inputs(
                     gather_indices.shape[0], ((raw_cap + align - 1) // align) * align
                 )
                 gather_indices = gather_indices[:max_routes]
+                if max_routes < num_tokens_local * local_num_experts:
+                    group_ends = jnp.cumsum(group_sizes_local, dtype=jnp.int32)
+                    group_starts = group_ends - group_sizes_local
+                    group_sizes_local = jnp.clip(
+                        max_routes - group_starts, 0, group_sizes_local
+                    )
+                    valid_count = jnp.minimum(valid_count, max_routes)
             x = ragged_gather_v2(
                 hidden_states_local,
                 gather_indices,
@@ -718,11 +728,15 @@ def moe_gmm(
                 axis=1
             )
             return (combine @ gmm2_res).astype(x.dtype)
-        combine_indices = (
-            jnp.minimum(argsort_revert_indices, gmm2_res.shape[0] - 1)
-            if gmm2_res.shape[0] < argsort_revert_indices.size
-            else argsort_revert_indices
-        )
+        if gmm2_res.shape[0] < argsort_revert_indices.size:
+            valid_mask_flat = valid_mask_flat & (
+                argsort_revert_indices < gmm2_res.shape[0]
+            )
+            combine_indices = jnp.minimum(
+                argsort_revert_indices, gmm2_res.shape[0] - 1
+            )
+        else:
+            combine_indices = argsort_revert_indices
         return ragged_gather_reduce(
             gmm2_res,
             combine_indices,

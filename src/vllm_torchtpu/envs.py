@@ -223,6 +223,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
     VLLM_TPU_PREFILL_CADENCE_NO_ESCAPE: bool = False
     VLLM_TPU_SRPT_PROMOTE_WARM_WAITING: bool = False
+    VLLM_TPU_MOE_EP_MAX_ROUTES: int = 0
     VLLM_TPU_MEGAKERNEL: str = ""
     VLLM_TPU_EXPERIMENTAL_USE_RUST: bool = False
     VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY: str = ""
@@ -611,7 +612,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Execute per-channel FP8 dense linears directly in the Torch/XLA graph as
     # `torch.matmul(x, weight.to(x.dtype)) * weight_scale.to(x.dtype)`, avoiding
-    # per-layer `pallas.jax_op` custom-call barriers and layout copies.
+    # per-layer `jax_op` custom-call barriers and layout copies.
     "TPU_FP8_LINEAR_IN_GRAPH": env_bool("TPU_FP8_LINEAR_IN_GRAPH"),
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(
@@ -1375,6 +1376,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the waiting queue ahead of cold uncached prompts (with age anti-starvation).
     "VLLM_TPU_SRPT_PROMOTE_WARM_WAITING": env_bool(
         "VLLM_TPU_SRPT_PROMOTE_WARM_WAITING", default=False
+    ),
+    # Optional upper bound on per-shard SparseCore ragged_gather_v2 / gmm_v2
+    # routed rows under EP (0 keeps the exact num_tokens * local_num_experts
+    # ceiling). Floored at SparseCore's 60% VMEM threshold so small decode
+    # buckets remain on SparseCore.
+    "VLLM_TPU_MOE_EP_MAX_ROUTES": env_nonnegative_int(
+        "VLLM_TPU_MOE_EP_MAX_ROUTES", 0
     ),
     # Enable and configure the fused Pallas megakernel ("1"/"true" for defaults,
     # "ep"/"tp" for mode, or "mode=tp,buckets=8:16:32,verify_buckets=4:8:16,ab=1").

@@ -1029,3 +1029,101 @@ def test_connector_scheduler_partial_tail_alignment_and_hbm_headroom_promotion(
     assert list(scheduler.waiting)[0].request_id == "aged_long"
 
 
+def test_throttled_step_starts_async_load_past_ready_kv_holding_waiting(
+    shared_model_config, monkeypatch
+):
+    """When throttle_prefills=True, a completed async load sitting in
+    kv_holding_waiting must not block self.waiting from starting new 0-compute
+    async external KV loads."""
+    monkeypatch.setenv("VLLM_TPU_SRPT_PROMOTE_WARM_WAITING", "1")
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        num_blocks=32,
+        max_num_seqs=8,
+        max_num_batched_tokens=64,
+        scheduler_reserve_full_isl=True,
+    )
+    started_loads: list[str] = []
+
+    def fake_match(req, n):
+        if req.request_id == "ext_req":
+            return 2 * BLOCK_SIZE, True
+        return 0, False
+
+    def fake_after_alloc(req, blocks, n):
+        if n > 0:
+            started_loads.append(req.request_id)
+
+    stub_conn = SimpleNamespace(
+        connector_scheduler=SimpleNamespace(
+            config=SimpleNamespace(
+                supports_partial_tail=True,
+                tokens_per_hash=BLOCK_SIZE,
+                alignment_tokens=BLOCK_SIZE,
+            )
+        ),
+        supports_divergent_local_hybrid_hits=False,
+        requires_kv_delivery=False,
+        on_new_request=lambda req: None,
+        get_num_new_matched_tokens=fake_match,
+        update_state_after_alloc=fake_after_alloc,
+        build_connector_meta=lambda out: None,
+        request_finished=lambda req, block_ids: (False, None),
+        has_connector_metadata=lambda: False,
+        has_pending_block_frees=lambda: False,
+        has_pending_push_work=lambda: False,
+        reset_cache=lambda: True,
+        get_loaded_kv_cache_group_ids=lambda req: (),
+        get_external_cache_hit_sources=lambda req, n: {},
+    )
+    # Seed external hash directory for ext_prefix.
+    seed = _make_real_request("seed_async", 2 * BLOCK_SIZE, hasher, seed=601)
+    scheduler.connector = None
+    scheduler.add_request(seed)
+    scheduler.schedule()
+    scheduler.connector = stub_conn
+    scheduler._record_external_block_hashes(
+        SimpleNamespace(num_scheduled_tokens={"seed_async": 2 * BLOCK_SIZE})
+    )
+    scheduler.connector = None
+    scheduler.finish_requests("seed_async", RequestStatus.FINISHED_ABORTED)
+    scheduler.schedule()
+    assert scheduler.reset_prefix_cache(reset_connector=False) is True
+    scheduler.connector = stub_conn
+
+    # Put one running decode request so throttle_prefills=True activates defer_prefills.
+    dec = _make_real_request("dec_1", BLOCK_SIZE, hasher, seed=602)
+    scheduler.add_request(dec)
+    scheduler.schedule()
+
+    # Simulate a completed async load already sitting in kv_holding_waiting.
+    ready_kh = _make_real_request("ready_kh", 3 * BLOCK_SIZE, hasher, seed=603)
+    scheduler.requests["ready_kh"] = ready_kh
+    ready_kh.num_computed_tokens = 2 * BLOCK_SIZE
+    ready_kh.status = RequestStatus.WAITING
+    scheduler.kv_holding_waiting.add_request(ready_kh)
+
+    # Add a cold request ahead of an external-hit follow-up in self.waiting.
+    cold = _make_real_request("cold_req", 3 * BLOCK_SIZE, hasher, seed=604)
+    ext_req = _make_real_request(
+        "ext_req",
+        3 * BLOCK_SIZE,
+        hasher,
+        seed=605,
+        shared_prefix=list(seed.prompt_token_ids),
+    )
+    scheduler.add_request(cold)
+    scheduler.add_request(ext_req)
+
+    out = scheduler.schedule(throttle_prefills=True)
+    # Neither ready_kh nor cold_req may prefill on throttle_prefills=True,
+    # ready_kh stays at the head of kv_holding_waiting, AND ext_req entered
+    # WAITING_FOR_REMOTE_KVS (via immediate update_state_after_alloc or deferred_loads)!
+    assert "ready_kh" not in out.num_scheduled_tokens
+    assert "cold_req" not in out.num_scheduled_tokens
+    assert ext_req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert "ext_req" in started_loads or "ext_req" in scheduler.deferred_loads
+    assert list(scheduler.kv_holding_waiting)[0].request_id == "ready_kh"
+
+
+

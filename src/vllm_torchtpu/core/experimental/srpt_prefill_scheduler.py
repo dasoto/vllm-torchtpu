@@ -201,24 +201,57 @@ class SrptPrefillScheduler(AsyncScheduler):
             ext_tokens = (ext_tokens // align) * align
         return max(local_hit_tokens, ext_tokens)
 
-    def _waiting_req_fits_kv(self, request: Request, avail_blocks: int) -> bool:
-        """Whether ``avail_blocks`` can admit ``request`` under full-ISL reservation."""
-        if not self.scheduler_reserve_full_isl:
-            return True
-        hit_blocks, hit_tokens = self._prefix_hit(request)
-        full_num_tokens = min(request.num_tokens, self.max_model_len)
-        needed = self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
-            request_id=request.request_id,
-            num_tokens=full_num_tokens,
-            new_computed_blocks=hit_blocks.blocks,
-            num_encoder_tokens=0,
-            total_computed_tokens=hit_tokens,
-            num_local_computed_tokens=hit_tokens,
-            num_tokens_main_model=full_num_tokens,
-            apply_admission_cap=True,
-            prefill_end=max(request.num_prompt_tokens, request.num_tokens - 1),
-        )
-        return needed <= avail_blocks
+    def _waiting_req_fits_kv(
+        self, request: Request, free_blocks: int, reserved_async_blocks: int
+    ) -> tuple[bool, int, int]:
+        """Return ``(fits, local_hit, est_hit)`` matching ``allocate_slots``."""
+        hit_blocks, local_hit = self._prefix_hit(request)
+        est_hit = self._estimated_prefix_hit_tokens(request, local_hit)
+        is_async_ext = est_hit > local_hit
+        if not self.scheduler_reserve_full_isl and not is_async_ext:
+            return True, local_hit, est_hit
+        if is_async_ext:
+            block_aligned_local = (local_hit // self.block_size) * self.block_size
+            computed_blocks = self.kv_cache_manager.truncate_computed_blocks(
+                hit_blocks, block_aligned_local
+            ).blocks
+            num_local = block_aligned_local
+            total_comp = min(est_hit, self.max_model_len)
+        else:
+            computed_blocks = hit_blocks.blocks
+            num_local = local_hit
+            total_comp = min(local_hit, self.max_model_len)
+        watermark = self.kv_cache_manager.watermark_blocks if self.running else 0
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        if self.scheduler_reserve_full_isl:
+            full_num_tokens = min(request.num_tokens, self.max_model_len)
+            full_needed = self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
+                request_id=request.request_id,
+                num_tokens=full_num_tokens,
+                new_computed_blocks=computed_blocks,
+                num_encoder_tokens=0,
+                total_computed_tokens=total_comp,
+                num_local_computed_tokens=num_local,
+                num_tokens_main_model=full_num_tokens,
+                apply_admission_cap=True,
+                prefill_end=prefill_end,
+            )
+            if full_needed + watermark > free_blocks:
+                return False, local_hit, est_hit
+        if is_async_ext:
+            step_needed = self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
+                request_id=request.request_id,
+                num_tokens=total_comp,
+                new_computed_blocks=computed_blocks,
+                num_encoder_tokens=0,
+                total_computed_tokens=total_comp,
+                num_local_computed_tokens=num_local,
+                num_tokens_main_model=total_comp,
+                prefill_end=prefill_end,
+            )
+            if step_needed + watermark > free_blocks - reserved_async_blocks:
+                return False, local_hit, est_hit
+        return True, local_hit, est_hit
 
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
@@ -231,8 +264,8 @@ class SrptPrefillScheduler(AsyncScheduler):
             self._external_block_hashes.clear()
         return ok
 
-    def _maybe_promote_warm_waiting(self) -> None:
-        """Promote ready requests with fewest uncached prompt tokens in WINDOW."""
+    def _maybe_promote_warm_waiting(self, throttle_prefills: bool = False) -> None:
+        """Promote fitting ready requests ahead of blocked ones in SRPT order."""
         if (
             not self.promote_warm_waiting
             or self.policy != SchedulingPolicy.FCFS
@@ -249,67 +282,58 @@ class SrptPrefillScheduler(AsyncScheduler):
         now = time.time()
         kv_fetch_stages = getattr(self, "_kv_fetch_stages", None) or {}
         has_inflight_prefills = bool(getattr(self, "_inflight_prefills", None))
-        avail_blocks = 0
-        if self.scheduler_reserve_full_isl:
-            reserved = (
-                self._inflight_prefill_reserved_blocks() + self._spec_decode_step_blocks
-            )
-            if self.running:
-                reserved += self.kv_cache_manager.watermark_blocks
-            avail_blocks = max(
-                self.kv_cache_manager.block_pool.get_num_free_blocks() - reserved, 0
-            )
-        key_cache: dict[str, tuple[int, int, int, float, float]] = {}
+        free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        reserved_async_blocks = (
+            self._inflight_prefill_reserved_blocks() + self._spec_decode_step_blocks
+        )
+        key_cache: dict[str, tuple[int, int, int, int, float, float]] = {}
 
-        def rank_key(req: Request) -> tuple[int, int, int, float, float]:
+        def rank_key(req: Request) -> tuple[int, int, int, int, float, float]:
             cached_key = key_cache.get(req.request_id)
             if cached_key is not None:
                 return cached_key
-            est_hit = self._estimated_prefix_hit_tokens(req)
+            fits, local_hit, est_hit = self._waiting_req_fits_kv(
+                req, free_blocks, reserved_async_blocks
+            )
             uncached = max(req.num_tokens - est_hit, 0)
             wait_s = now - req.arrival_time
             is_stalled_fetch = kv_fetch_stages.get(req) == KV_FETCH_WAITING_TO_START
-            if not is_stalled_fetch and wait_s > _HARD_STARVATION_SECONDS:
+            if wait_s > _HARD_STARVATION_SECONDS:
                 tier = -1
-            elif not is_stalled_fetch and (
+            elif (
                 req.num_preemptions > 0
                 or uncached <= 8192
                 or wait_s > _WARM_STARVATION_SECONDS
             ):
                 tier = 0
             elif (
-                not is_stalled_fetch
-                and est_hit >= _WARM_FOLLOWUP_MIN_HIT_TOKENS
+                est_hit >= _WARM_FOLLOWUP_MIN_HIT_TOKENS
                 and uncached <= _WARM_FOLLOWUP_MAX_UNCACHED_TOKENS
             ):
                 tier = 1
             else:
                 tier = 2
             # Upstream Scheduler.schedule() executes `break` (head-of-line block)
-            # when waiting[0] fails full-ISL KV allocation. Demote non-critical
-            # requests whose full ISL exceeds free HBM blocks behind ready
-            # requests that DO fit, while letting critically aged requests hold
-            # the head of the queue so HBM blocks drain for them before timeout.
+            # when waiting[0] fails KV allocation. Demote non-critical requests
+            # that cannot currently pass allocate_slots behind every request that
+            # CAN fit, while letting critically aged requests hold the head so
+            # HBM blocks drain for them before timeout.
             exceeds_hbm = (
-                1
-                if (
-                    self.scheduler_reserve_full_isl
-                    and wait_s <= _CRITICAL_HOLD_SECONDS
-                    and not self._waiting_req_fits_kv(req, avail_blocks)
-                )
-                else 0
+                1 if (wait_s <= _CRITICAL_HOLD_SECONDS and not fits) else 0
             )
-            # Always let urgent/warm hits jump ahead of a stalled async fetch.
-            # Only let cold long prefills jump ahead of a stalled async fetch
-            # when no in-flight prefill is currently running.
-            demote_stalled_cold = (
+            demote_stalled_fetch = (
                 1 if (is_stalled_fetch and not has_inflight_prefills) else 0
             )
+            # On decode-only cadence steps (throttle_prefills=True), non-external
+            # prefills hit `break` at defer_prefills whereas external async loads
+            # (`load_kv_async=True`, 0 compute tokens) can launch Host->HBM DMA.
+            not_async_ext = 0 if (throttle_prefills and est_hit > local_hit) else 1
             primary_metric = req.arrival_time if tier == -1 else float(uncached)
             res = (
                 exceeds_hbm,
+                not_async_ext,
                 tier,
-                demote_stalled_cold,
+                demote_stalled_fetch,
                 primary_metric,
                 req.arrival_time,
             )
@@ -317,11 +341,9 @@ class SrptPrefillScheduler(AsyncScheduler):
             return res
 
         queue = cast(FCFSRequestQueue, self.waiting)
-        promotable = [
-            r for r in ready if rank_key(r)[0] == 0 and rank_key(r)[1] < 2
-        ]
-        if promotable:
-            ordered = sorted(promotable, key=rank_key)
+        fitting = [r for r in ready if rank_key(r)[0] == 0]
+        if fitting:
+            ordered = sorted(fitting, key=rank_key)
             if ready[: len(ordered)] != ordered:
                 for req in ordered:
                     queue.remove(req)
@@ -345,9 +367,10 @@ class SrptPrefillScheduler(AsyncScheduler):
         )
         if self.cadence_no_escape:
             self.prefill_capacity_bound = False
-        self._maybe_promote_warm_waiting()
+        self._maybe_promote_warm_waiting(throttle_prefills=throttle_prefills)
 
         held: list[Request] = []
+        stashed_kv_holding: list[Request] = []
         target = None
         prefilling: list[Request] = []
         prev_pause_state = self._pause_state
@@ -371,6 +394,30 @@ class SrptPrefillScheduler(AsyncScheduler):
             prefilling = [r for r in self.running if r.is_prefill_chunk]
             held, target = self._select_chunks_to_hold()
 
+        if (
+            throttle_prefills
+            and not cross_rank_decode_hold
+            and self.connector is not None
+            and self.kv_holding_waiting
+        ):
+            # Completed async KV loads waiting for a prefill step sit in
+            # kv_holding_waiting and trigger `break` at `defer_prefills`,
+            # preventing `self.waiting` from starting new 0-compute async DMA
+            # loads during decode steps. Temporarily step past them while
+            # keeping WAITING_FOR_REMOTE_KVS entries visible for poll completion.
+            keep_kv_holding: list[Request] = []
+            while self.kv_holding_waiting:
+                req_k = self.kv_holding_waiting.pop_request()
+                if (
+                    req_k.status == RequestStatus.WAITING
+                    and 0 < req_k.num_computed_tokens < req_k.num_tokens - 1
+                ):
+                    stashed_kv_holding.append(req_k)
+                else:
+                    keep_kv_holding.append(req_k)
+            if keep_kv_holding:
+                self.kv_holding_waiting.prepend_requests(keep_kv_holding)
+
         held_ids = {r.request_id for r in held}
         self.running[:] = [r for r in self.running if r.request_id not in held_ids]
         self.max_num_running_reqs -= len(held)
@@ -390,6 +437,8 @@ class SrptPrefillScheduler(AsyncScheduler):
             self.max_num_running_reqs += len(held)
             self.max_num_active_reqs += len(held)
             self.running.extend(held)
+            if stashed_kv_holding:
+                self.kv_holding_waiting.prepend_requests(stashed_kv_holding)
 
         self._record_external_block_hashes(output)
 
