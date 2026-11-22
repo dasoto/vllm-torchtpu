@@ -172,8 +172,12 @@ def _quantized_all_gather_with_routing(
         if tw_dtype == torch.float32
         else topk_weights.to(torch.float32)
     )
+    # Convert int32 expert IDs via numeric f32 cast (never bitcast .view(f32),
+    # because small integer bit patterns 1..895 are IEEE-754 subnormals that
+    # TPU VPU flush-to-zero turns into 0). Every int32 in [-2^24, 2^24] is
+    # represented bit-exactly as a normal f32 float.
     packed_meta = torch.cat(
-        (scale, tw_f32, topk_ids.contiguous().view(torch.float32)),
+        (scale, tw_f32, topk_ids.to(torch.float32)),
         dim=-1,
     )
     ag_rows = collective_group.all_gather(quantized.view(torch.int8), dim=0)
@@ -182,7 +186,7 @@ def _quantized_all_gather_with_routing(
     ag_tw = ag_meta[:, s_cols : s_cols + k]
     if tw_dtype != torch.float32:
         ag_tw = ag_tw.to(tw_dtype)
-    ag_ti = ag_meta[:, s_cols + k :].contiguous().view(torch.int32)
+    ag_ti = ag_meta[:, s_cols + k :].to(torch.int32)
     ag_hs = dequantize_tensor(
         ag_rows.view(q_dtype), ag_scale, axis=-1, out_dtype=out_dtype
     )

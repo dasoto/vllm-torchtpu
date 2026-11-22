@@ -1132,3 +1132,25 @@ def test_quantized_all_gather_uses_int8_when_requantize_dtype_is_int8(monkeypatc
     )
     assert float(cos) > 0.9999
     assert dp_group.call_log[0] == ("all_gather", torch.Size([4, 64]), torch.int8)
+
+
+def test_quantized_all_gather_with_routing_preserves_nonzero_expert_ids_without_subnormal_ftz():
+    from vllm_torchtpu.layers.adapter import pipelined_fused_moe as pfm
+
+    class _FtZCollectiveGroup(_MockCollectiveGroup):
+        def all_gather(self, tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
+            if tensor.dtype == torch.float32:
+                # Simulate TPU VPU flush-to-zero on subnormal float32 bit patterns (< 2^-126).
+                tensor = torch.where(tensor.abs() < 1.1754944e-38, 0.0, tensor)
+            return super().all_gather(tensor, dim=dim)
+
+    group = _FtZCollectiveGroup(world_size=4, rank=0)
+    hs = torch.randn(8, 128, dtype=torch.bfloat16)
+    tw = torch.linspace(0.05, 0.95, 8 * 16, dtype=torch.bfloat16).reshape(8, 16)
+    ti = torch.arange(1, 1 + 8 * 16, dtype=torch.int32).reshape(8, 16) % 896
+    ti[-1, -1] = -1
+
+    ag_hs, ag_tw, ag_ti = pfm._quantized_all_gather_with_routing(group, hs, tw, ti)
+    assert ag_hs.shape == (32, 128)
+    assert torch.equal(ag_tw, torch.cat([tw] * 4, dim=0))
+    assert torch.equal(ag_ti, torch.cat([ti] * 4, dim=0))
