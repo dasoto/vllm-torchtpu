@@ -127,6 +127,7 @@ class SrptPrefillScheduler(AsyncScheduler):
         # Attention work and whether a prefill chunk was scheduled so far in
         # this step's Scheduler.schedule(), and the requests the cap shrank.
         self._in_schedule = False
+        self._cross_rank_decode_hold_active = False
         self._attn_work = 0.0
         self._attn_prefill_scheduled = False
         self._attn_capped: set[str] = set()
@@ -210,7 +211,12 @@ class SrptPrefillScheduler(AsyncScheduler):
         hit_blocks, local_hit = self._prefix_hit(request)
         est_hit = self._estimated_prefix_hit_tokens(request, local_hit)
         is_async_ext = est_hit > local_hit
-        if not self.scheduler_reserve_full_isl and not is_async_ext:
+        check_full_isl = self.scheduler_reserve_full_isl or (
+            self.connector is not None
+            and self.promote_warm_waiting
+            and reserved_async_blocks > 0
+        )
+        if not check_full_isl and not is_async_ext and self.connector is None:
             return True, local_hit, est_hit
         if is_async_ext:
             block_aligned_local = (local_hit // self.block_size) * self.block_size
@@ -225,7 +231,12 @@ class SrptPrefillScheduler(AsyncScheduler):
             total_comp = min(local_hit, self.max_model_len)
         watermark = self.kv_cache_manager.watermark_blocks if self.running else 0
         prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
-        if self.scheduler_reserve_full_isl:
+        effective_free = (
+            free_blocks - reserved_async_blocks
+            if (is_async_ext or self.promote_warm_waiting or self.connector is not None)
+            else free_blocks
+        )
+        if check_full_isl:
             full_num_tokens = min(request.num_tokens, self.max_model_len)
             full_needed = self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
                 request_id=request.request_id,
@@ -238,7 +249,7 @@ class SrptPrefillScheduler(AsyncScheduler):
                 apply_admission_cap=True,
                 prefill_end=prefill_end,
             )
-            if full_needed + watermark > free_blocks:
+            if full_needed + watermark > effective_free:
                 return False, local_hit, est_hit
         if is_async_ext:
             step_needed = self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
@@ -252,6 +263,26 @@ class SrptPrefillScheduler(AsyncScheduler):
                 prefill_end=prefill_end,
             )
             if step_needed + watermark > free_blocks - reserved_async_blocks:
+                return False, local_hit, est_hit
+        elif not check_full_isl:
+            rem = max(request.num_tokens - total_comp, 1)
+            lptt = self.scheduler_config.long_prefill_token_threshold
+            step_new = min(rem, lptt) if lptt > 0 else rem
+            step_new = min(step_new, self.scheduler_config.max_num_batched_tokens)
+            num_main = min(total_comp + step_new, self.max_model_len)
+            step_needed = self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
+                request_id=request.request_id,
+                num_tokens=min(
+                    num_main + self.num_lookahead_tokens, self.max_model_len
+                ),
+                new_computed_blocks=computed_blocks,
+                num_encoder_tokens=0,
+                total_computed_tokens=total_comp,
+                num_local_computed_tokens=num_local,
+                num_tokens_main_model=num_main,
+                prefill_end=prefill_end,
+            )
+            if step_needed + watermark > effective_free:
                 return False, local_hit, est_hit
         return True, local_hit, est_hit
 
@@ -493,10 +524,14 @@ class SrptPrefillScheduler(AsyncScheduler):
             and not local_decoding
             and self._other_rank_decoding
         )
+        self._cross_rank_decode_hold_active = False
         if cross_rank_decode_hold:
             held = [r for r in self.running if r.is_prefill_chunk]
-            if prev_pause_state == PauseState.UNPAUSED:
-                self._pause_state = PauseState.PAUSED_NEW
+            if self.connector is None:
+                if prev_pause_state == PauseState.UNPAUSED:
+                    self._pause_state = PauseState.PAUSED_NEW
+            else:
+                self._cross_rank_decode_hold_active = True
             self.max_num_scheduled_tokens = min(
                 prev_max_scheduled, self.scheduler_config.max_num_seqs
             )
@@ -507,11 +542,13 @@ class SrptPrefillScheduler(AsyncScheduler):
             prefilling = [r for r in self.running if r.is_prefill_chunk]
             held, target = self._select_chunks_to_hold()
 
-        if self.connector is not None and not cross_rank_decode_hold and self.waiting:
+        if self.connector is not None and self.waiting:
             # Bound concurrent pre-staged external async loads in kv_holding_waiting
             # (`_MAX_PRESTAGED_KV_HOLDING`) so a burst of 0-compute async loads
             # inside one step or decode cycle cannot hoard HBM KV blocks needed
-            # by already-fetched warm requests and active decodes.
+            # by already-fetched warm requests and active decodes. On
+            # `cross_rank_decode_hold` steps, also stash non-async prefill
+            # requests so `self.waiting` only initiates 0-compute async KV loads.
             allowed_new_async = max(
                 0, _MAX_PRESTAGED_KV_HOLDING - len(self.kv_holding_waiting)
             )
@@ -521,14 +558,21 @@ class SrptPrefillScheduler(AsyncScheduler):
             for req_w in original_waiting_order:
                 if not self._is_blocked_waiting_status(req_w.status):
                     _, loc_h = self._prefix_hit(req_w)
-                    if (
+                    is_async_candidate = (
                         req_w.num_computed_tokens == 0
                         and self._estimated_prefix_hit_tokens(req_w, loc_h) > loc_h
-                    ):
+                    )
+                    if is_async_candidate:
                         if seen_async >= allowed_new_async:
                             stashed_excess_async.append(req_w)
                             continue
                         seen_async += 1
+                    elif (
+                        cross_rank_decode_hold
+                        and req_w.num_computed_tokens < req_w.num_tokens - 1
+                    ):
+                        stashed_excess_async.append(req_w)
+                        continue
                 kept_waiting.append(req_w)
             if stashed_excess_async:
                 while self.waiting:
@@ -538,12 +582,12 @@ class SrptPrefillScheduler(AsyncScheduler):
 
         if (
             throttle_prefills
-            and not cross_rank_decode_hold
             and self.connector is not None
             and self.kv_holding_waiting
         ):
             # Completed async KV loads waiting for a prefill step sit in
-            # kv_holding_waiting and trigger `break` at `defer_prefills`,
+            # kv_holding_waiting and trigger `break` at `defer_prefills` (or
+            # would run prefill tokens under `cross_rank_decode_hold`),
             # preventing `self.waiting` from starting new 0-compute async DMA
             # loads during decode steps. Temporarily step past them while
             # keeping WAITING_FOR_REMOTE_KVS entries visible for poll completion.
@@ -580,6 +624,7 @@ class SrptPrefillScheduler(AsyncScheduler):
                 self.prefill_capacity_bound = False
         finally:
             self._in_schedule = False
+            self._cross_rank_decode_hold_active = False
             self._pause_state = prev_pause_state
             self.max_num_scheduled_tokens = prev_max_scheduled
             self.max_num_running_reqs += len(held)
@@ -694,6 +739,32 @@ class SrptPrefillScheduler(AsyncScheduler):
         # Scheduler.schedule() calls this on every request it is about to
         # schedule, in both queues, after its token budget limits, so it is
         # where the step's attention work is tracked and capped.
+        if self._in_schedule:
+            if (
+                self._cross_rank_decode_hold_active
+                and num_computed_tokens < request.num_tokens - 1
+            ):
+                return 0
+            if (
+                num_new_tokens > 0
+                and self.promote_warm_waiting
+                and self._inflight_prefills
+                and (self.scheduler_reserve_full_isl or self.connector is not None)
+                and request.status == RequestStatus.WAITING
+                and request.num_preemptions == 0
+                and request.num_computed_tokens == 0
+                and not self._holds_kv_blocks(request)
+            ):
+                free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
+                reserved_async_blocks = (
+                    self._inflight_prefill_reserved_blocks()
+                    + self._spec_decode_step_blocks
+                )
+                fits, _, _ = self._waiting_req_fits_kv(
+                    request, free_blocks, reserved_async_blocks
+                )
+                if not fits:
+                    return 0
         if not (self._in_schedule and self._attn_cap_on):
             return super()._reserve_prefill_lookahead(
                 request, num_computed_tokens, num_new_tokens
@@ -854,16 +925,31 @@ class SrptPrefillScheduler(AsyncScheduler):
         for r in self.waiting:
             if not self._is_ready_waiting_request(r):
                 continue
-            if self.connector is not None and r.num_computed_tokens == 0:
+            if r.num_computed_tokens == 0 and (
+                self.connector is not None
+                or (
+                    self.promote_warm_waiting
+                    and self.scheduler_reserve_full_isl
+                    and self._inflight_prefills
+                )
+            ):
                 fits, local_hit, est_hit = self._waiting_req_fits_kv(
                     r, free_blocks, reserved_async_blocks
                 )
-                if est_hit > local_hit:
+                if self.connector is not None and est_hit > local_hit:
                     # External async loads (`load_kv_async=True`) consume 0
                     # token_budget and `continue` in Scheduler.schedule() if
                     # they fit KV, or `break` if they do not fit.
                     if not fits:
                         return None
+                    continue
+                if (
+                    not fits
+                    and self.promote_warm_waiting
+                    and self._inflight_prefills
+                    and r.status == RequestStatus.WAITING
+                    and r.num_preemptions == 0
+                ):
                     continue
             return r
         return None

@@ -128,6 +128,67 @@ def _quantized_all_gather(
     return ag_hidden_states
 
 
+def _quantized_all_gather_with_routing(
+    collective_group,
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor | None,
+    topk_ids: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """All-gather quantized activations while fusing 32-bit scale + routing metadata."""
+    if (
+        topk_weights is None
+        or topk_ids is None
+        or topk_weights.dtype
+        not in (torch.float32, torch.bfloat16, torch.float16)
+        or topk_ids.dtype != torch.int32
+    ):
+        ag_hs = _quantized_all_gather(collective_group, hidden_states)
+        ag_tw = (
+            collective_group.all_gather(topk_weights, dim=0)
+            if topk_weights is not None
+            else None
+        )
+        ag_ti = (
+            collective_group.all_gather(topk_ids, dim=0)
+            if topk_ids is not None
+            else None
+        )
+        return ag_hs, ag_tw, ag_ti
+
+    out_dtype = hidden_states.dtype
+    tw_dtype = topk_weights.dtype
+    q_dtype = (
+        torch.int8
+        if envs.REQUANTIZE_WEIGHT_DTYPE == "int8"
+        else torch.float8_e4m3fn
+    )
+    quantized, scale = quantize_tensor(
+        hidden_states, quant_dtype=q_dtype, axis=-1
+    )
+    k = topk_weights.shape[-1]
+    s_cols = scale.shape[-1]
+    tw_f32 = (
+        topk_weights
+        if tw_dtype == torch.float32
+        else topk_weights.to(torch.float32)
+    )
+    packed_meta = torch.cat(
+        (scale, tw_f32, topk_ids.contiguous().view(torch.float32)),
+        dim=-1,
+    )
+    ag_rows = collective_group.all_gather(quantized.view(torch.int8), dim=0)
+    ag_meta = collective_group.all_gather(packed_meta, dim=0)
+    ag_scale = ag_meta[:, :s_cols]
+    ag_tw = ag_meta[:, s_cols : s_cols + k]
+    if tw_dtype != torch.float32:
+        ag_tw = ag_tw.to(tw_dtype)
+    ag_ti = ag_meta[:, s_cols + k :].contiguous().view(torch.int32)
+    ag_hs = dequantize_tensor(
+        ag_rows.view(q_dtype), ag_scale, axis=-1, out_dtype=out_dtype
+    )
+    return ag_hs, ag_tw, ag_ti
+
+
 def calculate_moe_chunks(
     seq_len: int, parallel_size: int, chunk_size: int
 ) -> tuple[int, int]:
@@ -265,21 +326,23 @@ def pipelined_fused_moe_gmm(
             # parallel_size > 1 only when collective_group is set.
             assert collective_group is not None
             if quantize_ag:
-                ag_hidden_states = _quantized_all_gather(
-                    collective_group, hidden_states
+                ag_hidden_states, ag_topk_weights, ag_topk_ids = (
+                    _quantized_all_gather_with_routing(
+                        collective_group, hidden_states, topk_weights, topk_ids
+                    )
                 )
             else:
                 ag_hidden_states = collective_group.all_gather(hidden_states, dim=0)
-            ag_topk_weights = (
-                collective_group.all_gather(topk_weights, dim=0)
-                if topk_weights is not None
-                else None
-            )
-            ag_topk_ids = (
-                collective_group.all_gather(topk_ids, dim=0)
-                if topk_ids is not None
-                else None
-            )
+                ag_topk_weights = (
+                    collective_group.all_gather(topk_weights, dim=0)
+                    if topk_weights is not None
+                    else None
+                )
+                ag_topk_ids = (
+                    collective_group.all_gather(topk_ids, dim=0)
+                    if topk_ids is not None
+                    else None
+                )
         else:
             ag_hidden_states = hidden_states
             ag_topk_weights = topk_weights
@@ -334,22 +397,27 @@ def pipelined_fused_moe_gmm(
         else [None] * num_chunks
     )
 
-    def _all_gather_hs(hs_slice):
+    def _all_gather_chunk(hs_slice, w_slice, id_slice):
         if quantize_ag:
-            return _quantized_all_gather(collective_group, hs_slice)
-        return collective_group.all_gather(hs_slice, dim=0)
+            return _quantized_all_gather_with_routing(
+                collective_group, hs_slice, w_slice, id_slice
+            )
+        ag_hs = collective_group.all_gather(hs_slice, dim=0)
+        ag_tw = (
+            collective_group.all_gather(w_slice, dim=0)
+            if w_slice is not None
+            else None
+        )
+        ag_ti = (
+            collective_group.all_gather(id_slice, dim=0)
+            if id_slice is not None
+            else None
+        )
+        return ag_hs, ag_tw, ag_ti
 
     # Prime pipeline with initial all-gather for chunk 0
-    ag_hs_curr = _all_gather_hs(hs_slices[0])
-    ag_tw_curr = (
-        collective_group.all_gather(weights_slices[0], dim=0)
-        if weights_slices[0] is not None
-        else None
-    )
-    ag_ti_curr = (
-        collective_group.all_gather(ids_slices[0], dim=0)
-        if ids_slices[0] is not None
-        else None
+    ag_hs_curr, ag_tw_curr, ag_ti_curr = _all_gather_chunk(
+        hs_slices[0], weights_slices[0], ids_slices[0]
     )
 
     rs_outputs = []
@@ -358,19 +426,8 @@ def pipelined_fused_moe_gmm(
         ag_hs_next = ag_tw_next = ag_ti_next = None
         # Issue asynchronous all-gather for next chunk if available
         if i + 1 < num_chunks:
-            ag_hs_next = _all_gather_hs(hs_slices[i + 1])
-            # Locals let the None checks below narrow; subscripts do not.
-            weights_next = weights_slices[i + 1]
-            ag_tw_next = (
-                collective_group.all_gather(weights_next, dim=0)
-                if weights_next is not None
-                else None
-            )
-            ids_next = ids_slices[i + 1]
-            ag_ti_next = (
-                collective_group.all_gather(ids_next, dim=0)
-                if ids_next is not None
-                else None
+            ag_hs_next, ag_tw_next, ag_ti_next = _all_gather_chunk(
+                hs_slices[i + 1], weights_slices[i + 1], ids_slices[i + 1]
             )
 
         # Compute MoE kernel for current gathered chunk

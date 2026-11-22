@@ -1321,3 +1321,197 @@ def test_async_external_loads_capped_and_do_not_trigger_false_chunk_hold(
     assert len(scheduler.kv_holding_waiting) == 2
     assert [r.request_id for r in scheduler.waiting] == ["ext_2", "ext_3"]
 
+
+@pytest.mark.parametrize("scheduler_reserve_full_isl", [True, False])
+def test_cold_request_cannot_overcommit_inflight_reservations_ahead_of_warm_async(
+    shared_model_config, monkeypatch, scheduler_reserve_full_isl
+):
+    """When _inflight_prefills reserves remaining KV blocks, a cold Turn-0
+    request whose full ISL fits raw free_blocks but exceeds (free - reserved)
+    must neither leapfrog a warm external follow-up nor over-commit HBM."""
+    monkeypatch.setenv("VLLM_TPU_SRPT_PROMOTE_WARM_WAITING", "1")
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        num_blocks=8,  # 7 usable blocks (block 0 is null)
+        max_num_seqs=8,
+        max_num_batched_tokens=BLOCK_SIZE,
+        long_prefill_token_threshold=BLOCK_SIZE,
+        scheduler_reserve_full_isl=scheduler_reserve_full_isl,
+    )
+    stub_conn = SimpleNamespace(
+        connector_scheduler=SimpleNamespace(
+            config=SimpleNamespace(
+                supports_partial_tail=True,
+                tokens_per_hash=BLOCK_SIZE,
+                alignment_tokens=BLOCK_SIZE,
+            )
+        ),
+        supports_divergent_local_hybrid_hits=False,
+        requires_kv_delivery=False,
+        on_new_request=lambda req: None,
+        get_num_new_matched_tokens=lambda req, n: (
+            (2 * BLOCK_SIZE, True) if req.request_id == "warm_ext" else (0, False)
+        ),
+        update_state_after_alloc=lambda req, blocks, n: None,
+        build_connector_meta=lambda out: None,
+        request_finished=lambda req, block_ids: (False, None),
+        has_connector_metadata=lambda: False,
+        has_pending_block_frees=lambda: False,
+        has_pending_push_work=lambda: False,
+        reset_cache=lambda: True,
+        get_loaded_kv_cache_group_ids=lambda req: (),
+        get_external_cache_hit_sources=lambda req, n: {},
+    )
+    # Seed external hashes for a 2-block prefix, then flush local HBM cache.
+    seed = _make_real_request("seed_rsv", 2 * BLOCK_SIZE, hasher, seed=1001)
+    scheduler.add_request(seed)
+    scheduler.schedule()
+    scheduler.schedule()
+    scheduler.connector = stub_conn
+    scheduler._record_external_block_hashes(
+        SimpleNamespace(num_scheduled_tokens={"seed_rsv": 2 * BLOCK_SIZE})
+    )
+    scheduler.connector = None
+    scheduler.finish_requests("seed_rsv", RequestStatus.FINISHED_ABORTED)
+    scheduler.schedule()
+    assert scheduler.reset_prefix_cache(reset_connector=False) is True
+
+    # Start `long` (5 blocks total -> 1 block allocated, 4 blocks reserved in
+    # _inflight_prefills). Out of 7 usable blocks, free_blocks == 6 and
+    # free - reserved == 2 blocks.
+    _running_long_prefill(scheduler, hasher, num_tokens=5 * BLOCK_SIZE)
+    scheduler.connector = stub_conn
+    assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 6
+    assert scheduler._inflight_prefill_reserved_blocks() >= 4
+
+    # Both `cold_3b` (3 blocks cold) and `warm_ext` (2 blocks ext + 1 block new = 3 blocks)
+    # fit raw free_blocks (3 <= 6) but exceed uncommitted blocks (3 > 6 - 4 = 2).
+    cold_3b = _make_real_request("cold_3b", 3 * BLOCK_SIZE, hasher, seed=1002)
+    warm_ext = _make_real_request(
+        "warm_ext",
+        3 * BLOCK_SIZE,
+        hasher,
+        seed=1003,
+        shared_prefix=list(seed.prompt_token_ids),
+    )
+    scheduler.add_request(cold_3b)
+    scheduler.add_request(warm_ext)
+
+    out = scheduler.schedule(throttle_prefills=False)
+    # `warm_ext` must stay ahead of `cold_3b`, and `cold_3b` must NOT be admitted!
+    assert out.num_scheduled_tokens == {"long": BLOCK_SIZE}
+    assert [r.request_id for r in scheduler.waiting] == ["warm_ext", "cold_3b"]
+
+    # Even if `warm_ext` is absent, `cold_3b` alone must NOT over-commit HBM,
+    # whereas a 1-block fitting request (`short_1b`) CAN be admitted!
+    scheduler.finish_requests("warm_ext", RequestStatus.FINISHED_ABORTED)
+    short_1b = _make_real_request("short_1b", BLOCK_SIZE, hasher, seed=1004)
+    scheduler.add_request(short_1b)
+    out2 = scheduler.schedule(throttle_prefills=False)
+    assert "cold_3b" not in out2.num_scheduled_tokens
+    assert "short_1b" in out2.num_scheduled_tokens
+
+
+def test_cross_rank_decode_hold_starts_zero_compute_async_load_without_prefilling(
+    shared_model_config, monkeypatch
+):
+    """On a cross_rank_decode_hold step (throttle_prefills=True, no local decodes,
+    other_rank_decoding=True), 0-compute async external KV loads must launch and
+    completed loads must poll without scheduling any prefill compute tokens."""
+    monkeypatch.setenv("VLLM_TPU_SRPT_PROMOTE_WARM_WAITING", "1")
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        num_blocks=32,
+        max_num_seqs=8,
+        max_num_batched_tokens=2 * BLOCK_SIZE,
+        long_prefill_token_threshold=BLOCK_SIZE,
+        scheduler_reserve_full_isl=True,
+    )
+    scheduler.cadence_no_escape = True
+    started_loads: list[str] = []
+
+    def fake_match(req, n):
+        if req.request_id == "ext_hold":
+            return 2 * BLOCK_SIZE, True
+        return 0, False
+
+    def fake_after_alloc(req, blocks, n):
+        if n > 0:
+            started_loads.append(req.request_id)
+
+    stub_conn = SimpleNamespace(
+        connector_scheduler=SimpleNamespace(
+            config=SimpleNamespace(
+                supports_partial_tail=True,
+                tokens_per_hash=BLOCK_SIZE,
+                alignment_tokens=BLOCK_SIZE,
+            )
+        ),
+        supports_divergent_local_hybrid_hits=False,
+        requires_kv_delivery=False,
+        on_new_request=lambda req: None,
+        get_num_new_matched_tokens=fake_match,
+        update_state_after_alloc=fake_after_alloc,
+        build_connector_meta=lambda out: None,
+        request_finished=lambda req, block_ids: (False, None),
+        has_connector_metadata=lambda: False,
+        has_pending_block_frees=lambda: False,
+        has_pending_push_work=lambda: False,
+        reset_cache=lambda: True,
+        get_loaded_kv_cache_group_ids=lambda req: (),
+        get_external_cache_hit_sources=lambda req, n: {},
+    )
+    seed = _make_real_request("seed_crh", 2 * BLOCK_SIZE, hasher, seed=1101)
+    scheduler.add_request(seed)
+    scheduler.schedule()
+    scheduler.connector = stub_conn
+    scheduler._record_external_block_hashes(
+        SimpleNamespace(num_scheduled_tokens={"seed_crh": 2 * BLOCK_SIZE})
+    )
+    scheduler.connector = None
+    scheduler.finish_requests("seed_crh", RequestStatus.FINISHED_ABORTED)
+    scheduler.schedule()
+    assert scheduler.reset_prefix_cache(reset_connector=False) is True
+
+    # Put one running prefill chunk (`long`, 0 local decodes) and set other_rank_decoding=True.
+    req_long = _running_long_prefill(scheduler, hasher, num_tokens=4 * BLOCK_SIZE)
+    scheduler.connector = stub_conn
+    scheduler._other_rank_decoding = True
+
+    # Add a just-completed load (`done_kh`) in kv_holding_waiting to verify it
+    # polls completion (`WAITING_FOR_REMOTE_KVS -> WAITING`) without prefilling.
+    done_kh = _make_real_request("done_kh", 3 * BLOCK_SIZE, hasher, seed=1102)
+    scheduler.requests["done_kh"] = done_kh
+    scheduler.kv_cache_manager.allocate_slots(
+        done_kh, 2 * BLOCK_SIZE, delay_cache_blocks=True
+    )
+    done_kh.num_computed_tokens = 2 * BLOCK_SIZE
+    done_kh.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    scheduler._inflight_prefills.add(done_kh)
+    scheduler.finished_recving_kv_req_ids.add("done_kh")
+    scheduler.kv_holding_waiting.add_request(done_kh)
+
+    cold_w = _make_real_request("cold_w", 3 * BLOCK_SIZE, hasher, seed=1103)
+    ext_hold = _make_real_request(
+        "ext_hold",
+        3 * BLOCK_SIZE,
+        hasher,
+        seed=1104,
+        shared_prefix=list(seed.prompt_token_ids),
+    )
+    scheduler.add_request(cold_w)
+    scheduler.add_request(ext_hold)
+
+    out = scheduler.schedule(throttle_prefills=True)
+    assert out.num_scheduled_tokens == {}
+    assert req_long in scheduler.running
+    assert done_kh.status == RequestStatus.WAITING
+    assert ext_hold.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert "ext_hold" in started_loads or "ext_hold" in scheduler.deferred_loads
+    assert [r.request_id for r in scheduler.kv_holding_waiting] == [
+        "done_kh",
+        "ext_hold",
+    ]
+    assert [r.request_id for r in scheduler.waiting] == ["cold_w"]
+
+

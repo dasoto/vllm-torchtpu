@@ -492,7 +492,14 @@ def kernel(
             ret.append(s_summed.reshape(-1, num_sublanes_bkv, 128))
         return jnp.concatenate(ret, axis=0)
 
-    def step_body(q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref=None):
+    def step_body(
+        q_vmem,
+        weights_vmem,
+        bkv_vmem,
+        scores_vmem,
+        q_hm_ref=None,
+        q_dec_bf16_ref=None,
+    ):
         bkv_idx = bkv_block(pl.program_id(0))
 
         if q_hm_ref is not None:
@@ -503,11 +510,28 @@ def kernel(
             # == 0` marks exactly the first step of each new q block.
             @pl.when(bkv_idx == 0)
             def _():
-                q_hm_ref[...] = transpose_to_head_major(
+                hm = transpose_to_head_major(
                     pad_tokens(q_vmem[...], bq_sz), hm_tok
                 )
+                if hm.dtype != q_hm_ref.dtype:
+                    hm = hm.astype(q_hm_ref.dtype)
+                q_hm_ref[...] = hm
 
             bq_vec = [q_hm_ref[...]]
+        elif q_dec_bf16_ref is not None:
+            @pl.when(bkv_idx == 0)
+            def _():
+                q_dec_bf16_ref[...] = (
+                    q_vmem[...]
+                    .reshape(seq_batch_size * bq_sz * num_q_heads, head_dim)
+                    .astype(q_dec_bf16_ref.dtype)
+                )
+
+            rows_per_seq = bq_sz * num_q_heads
+            bq_vec = [
+                q_dec_bf16_ref[pl.ds(batch_idx * rows_per_seq, rows_per_seq)]
+                for batch_idx in range(seq_batch_size)
+            ]
         else:
             q_data = q_vmem[...].reshape(seq_batch_size, -1, head_dim)
             bq_vec = [q_data[batch_idx] for batch_idx in range(seq_batch_size)]
@@ -596,6 +620,8 @@ def kernel(
             for tb in range(num_tok_blks):
                 t0 = tb * tok_blk
                 q_rows = transpose_to_head_major(q_vmem[pl.ds(t0, tok_blk)], tok_blk)
+                if q_rows.dtype != q_hm_ref.dtype:
+                    q_rows = q_rows.astype(q_hm_ref.dtype)
                 for h in range(num_q_heads):
                     q_hm_ref[pl.ds(prefill_cfg.cache_row(h, tb), tok_blk)] = q_rows[
                         h * tok_blk : (h + 1) * tok_blk
@@ -622,6 +648,8 @@ def kernel(
                     ],
                     1,
                 )
+                if upcast_fp8_for_mxu and keys.dtype == jnp.float8_e4m3fn:
+                    keys = keys.astype(jnp.bfloat16)
                 scales = jnp.concatenate(
                     [
                         seq_along_lane_scale_tile(rows, 0, lane_tile_idx)
@@ -649,6 +677,8 @@ def kernel(
                 blk = bkv_vmem[0, pl.ds(c * groups_per_chunk, groups_per_chunk)]
                 flat = blk.reshape(lane_chunk, blk.shape[-1])
                 keys = pltpu.bitcast(flat[:, :head_dim], jnp.float8_e4m3fn)
+                if upcast_fp8_for_mxu and keys.dtype == jnp.float8_e4m3fn:
+                    keys = keys.astype(jnp.bfloat16)
                 scales = pltpu.bitcast(
                     flat[:, head_dim : head_dim + 1].T, jnp.float8_e8m0fnu
                 ).astype(jnp.float32)
@@ -737,13 +767,15 @@ def kernel(
                 s_summed.reshape(bq_sz, num_sublanes_bkv, 128), jnp.int32
             )
 
-    def _run_all(q_hm_ref=None, wb_ref=None):
+    def _run_all(q_hm_ref=None, wb_ref=None, q_dec_bf16_ref=None):
         if prefill_cfg.enabled:
             body = functools.partial(
                 blocked_prefill_step, q_hm_ref=q_hm_ref, wb_ref=wb_ref
             )
         else:
-            body = functools.partial(step_body, q_hm_ref=q_hm_ref)
+            body = functools.partial(
+                step_body, q_hm_ref=q_hm_ref, q_dec_bf16_ref=q_dec_bf16_ref
+            )
 
         @pl.with_scoped(final_allocs=(q_alloc, weights_alloc, kv_alloc, o_alloc))
         def _run_pipeline(final_allocs):
@@ -765,12 +797,17 @@ def kernel(
 
         _run_pipeline()
 
+    q_cache_dtype = (
+        jnp.bfloat16
+        if (upcast_fp8_for_mxu and q_hbm_ref.dtype == jnp.float8_e4m3fn)
+        else q_hbm_ref.dtype
+    )
     # Only the multi-token path reorders q, and only a single sequence per tile
     # keeps the cached block unambiguous.
     if prefill_cfg.enabled:
         pl.run_scoped(
             _run_all,
-            pltpu.VMEM((num_q_heads * bq_sz, head_dim), q_hbm_ref.dtype),
+            pltpu.VMEM((num_q_heads * bq_sz, head_dim), q_cache_dtype),
             pltpu.VMEM(
                 (
                     prefill_cfg.num_tok_blks,
@@ -784,7 +821,18 @@ def kernel(
     elif seq_batch_size == 1 and bq_sz > 1:
         pl.run_scoped(
             _run_all,
-            pltpu.VMEM((num_q_heads * hm_tok, head_dim), q_hbm_ref.dtype),
+            pltpu.VMEM((num_q_heads * hm_tok, head_dim), q_cache_dtype),
+        )
+    elif (
+        upcast_fp8_for_mxu
+        and q_hbm_ref.dtype == jnp.float8_e4m3fn
+        and (bq_sz * num_q_heads) % 16 == 0
+    ):
+        pl.run_scoped(
+            lambda q_dec_ref: _run_all(q_dec_bf16_ref=q_dec_ref),
+            pltpu.VMEM(
+                (seq_batch_size * bq_sz * num_q_heads, head_dim), jnp.bfloat16
+            ),
         )
     else:
         _run_all()

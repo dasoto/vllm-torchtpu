@@ -1294,11 +1294,16 @@ def sparse_ragged_paged_attention(
         )
     if not sparsecore_layout or (topk_cap is not None and topk_cap >= topk):
         topk_cap = None
-    if topk_cap is not None and (topk_cap % GATHER_ATOM_ROWS or topk % topk_cap):
+    if topk_cap is not None and topk_cap % GATHER_ATOM_ROWS:
         raise ValueError(
-            f"topk_cap ({topk_cap}) must be a multiple of {GATHER_ATOM_ROWS} "
-            f"dividing topk ({topk})"
+            f"topk_cap ({topk_cap}) must be a multiple of {GATHER_ATOM_ROWS}"
         )
+    if topk_cap is not None and topk % topk_cap:
+        padded_topk = align_to(topk, topk_cap)
+        topk_indices = jnp.pad(
+            topk_indices, ((0, 0), (0, padded_topk - topk)), constant_values=-1
+        )
+        topk = padded_topk
 
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
     # With the cap, translate the top-k once per call straight into the capped

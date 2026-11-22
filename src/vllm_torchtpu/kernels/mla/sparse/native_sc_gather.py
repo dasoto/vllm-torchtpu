@@ -22,6 +22,7 @@ it every row is gathered.
 from __future__ import annotations
 
 import functools
+import math
 from typing import Any
 
 import jax
@@ -318,9 +319,16 @@ def dsa_gather_native_sc(
         )
     rope_rows_view = rope_cache.reshape(-1, rope_words)
 
-    max_possible_atoms = out_size // (num_owners * occurrences_per_atom)
+    owner_atom_size = num_owners * occurrences_per_atom
+    max_possible_atoms = out_size // owner_atom_size
     if atoms_per_batch > max_possible_atoms > 0:
         atoms_per_batch = max_possible_atoms
+    if (
+        atoms_per_batch > 0
+        and max_possible_atoms > 0
+        and out_size == max_possible_atoms * owner_atom_size
+    ):
+        atoms_per_batch = math.gcd(atoms_per_batch, max_possible_atoms)
     if atoms_per_batch <= 0:
         raise ValueError(
             f"atoms_per_batch ({atoms_per_batch}) must be > 0 "
