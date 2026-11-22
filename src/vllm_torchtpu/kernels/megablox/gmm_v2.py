@@ -540,10 +540,16 @@ def inner_kernel(
         acc_list = []
         if not cfgs.lhs_cfgs.should_quantize:
             # Unquantized matmul path.
+            decode_e2m1_per_k_block = (
+                is_emulated_e2m1 and not cfgs.rhs_cfgs.should_dequantize_before_matmul
+            )
             for start_n in range(0, rhs_tile_n, mxu_size):
                 end_n = min(rhs_tile_n, start_n + mxu_size)
                 col_size = end_n - start_n
-                if is_emulated_e2m1:
+                if decode_e2m1_per_k_block:
+                    strip_rhs_full = None
+                    step_rhs_qbs = rhs_qbs
+                elif is_emulated_e2m1:
                     strip_rhs_full, step_rhs_qbs = _prepare_emulated_e2m1_strip(
                         start_n, end_n, col_size
                     )
@@ -554,10 +560,23 @@ def inner_kernel(
                 acc_n = jnp.zeros((bucket_m, col_size), dtype=acc_ref.dtype)
                 for start_k in range(0, cfgs.tiles.tile_k, step_rhs_qbs):
                     end_k = min(cfgs.tiles.tile_k, start_k + step_rhs_qbs)
+                    if decode_e2m1_per_k_block:
+                        block_rhs = _decode_e2m1_u4(
+                            tiled_rhs[start_k:end_k, start_n:end_n],
+                            cfgs.lhs_cfgs.dtype,
+                        )
+                        if is_last_k_step and valid_k != 0 and end_k > valid_k:
+                            k_idx = start_k + lax.broadcasted_iota(
+                                jnp.int32, block_rhs.shape, 0
+                            )
+                            block_rhs = jnp.where(k_idx < valid_k, block_rhs, 0)
+                    else:
+                        assert strip_rhs_full is not None
+                        block_rhs = strip_rhs_full[start_k:end_k, :]
 
                     block_acc = jnp.matmul(
                         tiled_lhs[:, start_k:end_k],
-                        strip_rhs_full[start_k:end_k, :],
+                        block_rhs,
                         preferred_element_type=jnp.float32,
                     ).astype(acc_ref.dtype)
 
@@ -714,6 +733,10 @@ def inner_kernel(
         @jax.named_scope(f"bm{bucket_m}_last")
         def matmul_last():
             _matmul(is_first_k_step=False, is_last_k_step=True, bucket_m=bucket_m)
+
+        if cfgs.dims.size_k <= cfgs.tiles.tile_k:
+            matmul_first_last()
+            return
 
         num_k = pl.num_programs(2)
         k_id = pl.program_id(2)
@@ -1030,16 +1053,28 @@ def calculate_tiling(
     # safe to use for most scenarios. But if lower bitwidth is used, we need
     # to tweak tile_m to account for using faster hardware unit.
     # TODO(kyuyeunk): Account for different TPU hardware specs.
+    tpu_info = pltpu.get_tpu_info()
     bf16_bf16_tile_m = 128
     rhs_mod = min(pl.cdiv(16, rhs_bits), 2)
     tile_m = bf16_bf16_tile_m // rhs_mod
     if lhs_cfgs.should_quantize:
         tile_m *= 2
+    elif (
+        rhs_dtype == jnp.float4_e2m1fn
+        and getattr(tpu_info, "generation", 7) < 7
+        and dims.size_m > 8192
+    ):
+        # On TPU < v7, float4_e2m1fn runs on the BF16 MXU after software unpack
+        # rather than a 2x-throughput FP4 MXU. On large prefill batches
+        # (size_m > 8192), starting bucket_base at 256 (max tile_m = 1024 across
+        # 4 buckets) cuts expert weight HBM DMA and unpack 4x on hot shards
+        # while keeping small decode batches (size_m <= 8192) at bucket_base=64.
+        tile_m = 256
     tile_m = min(tile_m, dims.size_m)
 
     # To avoid stalling MXU, we add some buffer room where tile_n cannot go
     # smaller than 2x of mxu_column_size.
-    tile_n_limit = pltpu.get_tpu_info().mxu_column_size * 2
+    tile_n_limit = tpu_info.mxu_column_size * 2
     tile_n_limit = min(tile_n_limit, dims.size_n)
 
     size_n_per_rhs = dims.size_n
@@ -1467,11 +1502,12 @@ def gmm_v2(
     # Initialize scratch shapes.
     max_num_gm = dims.size_group + pl.cdiv(dims.size_m, tiles.tile_m) - 1
     acc_cols = 2 * tiles.tile_n if cfgs.fuse_act is not None else tiles.tile_n
+    acc_scratch_m = 1 if dims.size_k <= tiles.tile_k else tiles.tile_m
     scratch_shapes = [
         # partial_out_ref
         pltpu.VMEM((dims.size_lhs_sublane, tiles.tile_n), cfgs.out_dtype),
-        # acc_ref
-        pltpu.VMEM((tiles.tile_m, acc_cols), cfgs.acc_dtype),
+        # acc_ref (only touched across multi-K tiles when size_k > tile_k)
+        pltpu.VMEM((acc_scratch_m, acc_cols), cfgs.acc_dtype),
         # metadata_ref
         MetadataRef(
             gm_id_to_group_id=pltpu.SMEM((max_num_gm,), jnp.int32),

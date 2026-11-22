@@ -27,9 +27,12 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    Dimensions,
+    InputConfigs,
     TileSizes,
     _decode_e2m1_u4,
     apply_act_fn,
+    calculate_tiling,
     gmm_v2,
     interleave_lane,
     silu_and_mul_bf16,
@@ -101,6 +104,68 @@ def test_decode_e2m1_u4_bit_exact_all_nibbles(target_dtype):
     np.testing.assert_array_equal(
         np.asarray(jax.lax.bitcast_convert_type(got, bit_dtype)),
         np.asarray(jax.lax.bitcast_convert_type(expected, bit_dtype)),
+    )
+
+
+def test_calculate_tiling_v6e_fp4_prefill_uses_1024_tile_m(monkeypatch):
+    lhs_cfgs = InputConfigs(
+        quant_dtype=None, quant_block_size=512, dtype=jnp.bfloat16
+    )
+    rhs_cfgs = InputConfigs(
+        quant_dtype=jnp.float4_e2m1fn,
+        quant_block_size=512,
+        dtype=jnp.int32,
+        has_scale=True,
+    )
+    vmem_limit = int(128 * 1024 * 1024 * 0.9)
+
+    monkeypatch.setattr(
+        "vllm_torchtpu.kernels.megablox.gmm_v2.pltpu.get_tpu_info",
+        lambda: SimpleNamespace(
+            generation=6, mxu_column_size=256, num_lanes=128
+        ),
+    )
+    prefill_dims = Dimensions(
+        size_m=49152,
+        size_k=3584,
+        size_n=6144,
+        size_group=7,
+        size_lhs_group=7,
+        size_lhs_sublane=8,
+    )
+    prefill_tiles = calculate_tiling(
+        prefill_dims, lhs_cfgs, rhs_cfgs, vmem_limit, fuse_act="situ:4.0:25.0"
+    )
+    assert prefill_tiles == TileSizes(
+        tile_m=1024, tile_k=3584, tile_n=3072, bucket_base=256
+    )
+
+    decode_dims = Dimensions(
+        size_m=6144,
+        size_k=3584,
+        size_n=6144,
+        size_group=7,
+        size_lhs_group=7,
+        size_lhs_sublane=8,
+    )
+    decode_tiles = calculate_tiling(
+        decode_dims, lhs_cfgs, rhs_cfgs, vmem_limit, fuse_act="situ:4.0:25.0"
+    )
+    assert decode_tiles == TileSizes(
+        tile_m=256, tile_k=3584, tile_n=3072, bucket_base=64
+    )
+
+    monkeypatch.setattr(
+        "vllm_torchtpu.kernels.megablox.gmm_v2.pltpu.get_tpu_info",
+        lambda: SimpleNamespace(
+            generation=7, mxu_column_size=256, num_lanes=128
+        ),
+    )
+    v7_tiles = calculate_tiling(
+        prefill_dims, lhs_cfgs, rhs_cfgs, int(64 * 1024 * 1024 * 0.9), fuse_act="situ:4.0:25.0"
+    )
+    assert v7_tiles == TileSizes(
+        tile_m=256, tile_k=3584, tile_n=3072, bucket_base=64
     )
 
 
