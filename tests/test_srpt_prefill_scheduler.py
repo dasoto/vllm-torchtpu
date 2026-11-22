@@ -1126,4 +1126,47 @@ def test_throttled_step_starts_async_load_past_ready_kv_holding_waiting(
     assert list(scheduler.kv_holding_waiting)[0].request_id == "ready_kh"
 
 
+def test_preempted_and_aged_warm_hold_head_without_long_starvation(
+    shared_model_config, monkeypatch
+):
+    """Preempted requests immediately (0s) and warm follow-ups aged >15s must
+    hold the head of waiting so HBM blocks drain for deep sessions."""
+    monkeypatch.setenv("VLLM_TPU_SRPT_PROMOTE_WARM_WAITING", "1")
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        num_blocks=6,
+        max_num_seqs=8,
+        max_num_batched_tokens=64,
+        scheduler_reserve_full_isl=True,
+    )
+    active = _make_real_request("active_hold", 3 * BLOCK_SIZE, hasher, seed=701)
+    scheduler.add_request(active)
+    scheduler.schedule()
+
+    # Only 2 free blocks left: `preempted_deep` needs 4 blocks (doesn't fit yet),
+    # while `small_fit` needs 1 block (fits). Because `num_preemptions > 0`,
+    # `preempted_deep` must NOT be demoted behind `small_fit`.
+    small_fit = _make_real_request("small_fit", BLOCK_SIZE, hasher, seed=702)
+    preempted_deep = _make_real_request(
+        "preempted_deep", 4 * BLOCK_SIZE, hasher, seed=703
+    )
+    preempted_deep.num_preemptions = 1
+    scheduler.add_request(small_fit)
+    scheduler.add_request(preempted_deep)
+    scheduler._maybe_promote_warm_waiting()
+    assert list(scheduler.waiting)[0].request_id == "preempted_deep"
+
+    # Also verify a non-preempted warm request needing 4 blocks (> 2 free)
+    # yields to `small_fit` at 0s, then holds the head once aged > 15s.
+    scheduler.finish_requests(["preempted_deep"], RequestStatus.FINISHED_ABORTED)
+    aged_warm = _make_real_request("aged_warm", 4 * BLOCK_SIZE, hasher, seed=704)
+    scheduler.add_request(aged_warm)
+    scheduler._maybe_promote_warm_waiting()
+    assert list(scheduler.waiting)[0].request_id == "small_fit"
+    aged_warm.arrival_time -= 20.0
+    scheduler._maybe_promote_warm_waiting()
+    assert list(scheduler.waiting)[0].request_id == "aged_warm"
+
+
+
 

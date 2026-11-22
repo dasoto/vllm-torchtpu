@@ -92,7 +92,8 @@ _ATTN_CAP_LOG_EVERY = 10000
 _WARM_WINDOW = 128
 _WARM_STARVATION_SECONDS = 90.0
 _HARD_STARVATION_SECONDS = 600.0
-_CRITICAL_HOLD_SECONDS = 900.0
+_WARM_HOLD_HEAD_SECONDS = 15.0
+_CRITICAL_HOLD_SECONDS = 60.0
 _WARM_FOLLOWUP_MIN_HIT_TOKENS = 8192
 _WARM_FOLLOWUP_MAX_UNCACHED_TOKENS = 32768
 _MAX_EXTERNAL_BLOCK_HASHES = 65536
@@ -298,13 +299,39 @@ class SrptPrefillScheduler(AsyncScheduler):
             uncached = max(req.num_tokens - est_hit, 0)
             wait_s = now - req.arrival_time
             is_stalled_fetch = kv_fetch_stages.get(req) == KV_FETCH_WAITING_TO_START
-            if wait_s > _HARD_STARVATION_SECONDS:
-                tier = -1
-            elif (
+            is_warm_or_preempted = (
                 req.num_preemptions > 0
                 or uncached <= 8192
+                or (
+                    est_hit >= _WARM_FOLLOWUP_MIN_HIT_TOKENS
+                    and uncached <= _WARM_FOLLOWUP_MAX_UNCACHED_TOKENS
+                )
                 or wait_s > _WARM_STARVATION_SECONDS
+            )
+            # Upstream Scheduler.schedule() executes `break` (head-of-line block)
+            # when waiting[0] fails KV allocation. Demote freshly arrived
+            # non-preempted requests that cannot currently pass allocate_slots
+            # behind requests that CAN fit, while letting preempted streams
+            # immediately (0s) and aged warm/cold requests (15s / 60s) hold the
+            # head in tier -1 so HBM blocks drain for deep multi-turn sessions
+            # instead of starving behind a continuous stream of smaller arrivals.
+            hold_head_s = (
+                0.0
+                if req.num_preemptions > 0
+                else (
+                    _WARM_HOLD_HEAD_SECONDS
+                    if is_warm_or_preempted
+                    else _CRITICAL_HOLD_SECONDS
+                )
+            )
+            exceeds_hbm = 1 if (wait_s <= hold_head_s and not fits) else 0
+            if (
+                req.num_preemptions > 0
+                or wait_s > _HARD_STARVATION_SECONDS
+                or (not fits and wait_s > hold_head_s)
             ):
+                tier = -1
+            elif uncached <= 8192 or wait_s > _WARM_STARVATION_SECONDS:
                 tier = 0
             elif (
                 est_hit >= _WARM_FOLLOWUP_MIN_HIT_TOKENS
@@ -313,14 +340,6 @@ class SrptPrefillScheduler(AsyncScheduler):
                 tier = 1
             else:
                 tier = 2
-            # Upstream Scheduler.schedule() executes `break` (head-of-line block)
-            # when waiting[0] fails KV allocation. Demote non-critical requests
-            # that cannot currently pass allocate_slots behind every request that
-            # CAN fit, while letting critically aged requests hold the head so
-            # HBM blocks drain for them before timeout.
-            exceeds_hbm = (
-                1 if (wait_s <= _CRITICAL_HOLD_SECONDS and not fits) else 0
-            )
             demote_stalled_fetch = (
                 1 if (is_stalled_fetch and not has_inflight_prefills) else 0
             )
