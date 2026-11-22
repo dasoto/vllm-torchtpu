@@ -92,8 +92,8 @@ _ATTN_CAP_LOG_EVERY = 10000
 _WARM_WINDOW = 128
 _WARM_STARVATION_SECONDS = 90.0
 _HARD_STARVATION_SECONDS = 600.0
-_WARM_HOLD_HEAD_SECONDS = 15.0
-_CRITICAL_HOLD_SECONDS = 60.0
+_WARM_HOLD_HEAD_SECONDS = 90.0
+_CRITICAL_HOLD_SECONDS = 240.0
 _WARM_FOLLOWUP_MIN_HIT_TOKENS = 8192
 _WARM_FOLLOWUP_MAX_UNCACHED_TOKENS = 32768
 _MAX_EXTERNAL_BLOCK_HASHES = 65536
@@ -325,11 +325,19 @@ class SrptPrefillScheduler(AsyncScheduler):
                     else _CRITICAL_HOLD_SECONDS
                 )
             )
-            exceeds_hbm = 1 if (wait_s <= hold_head_s and not fits) else 0
+            # Holding waiting[0] while `_inflight_prefills` is non-empty cannot
+            # stop running prefill chunks from allocating blocks and only
+            # head-of-line blocks fitting warm follow-ups behind `_inflight_prefill_reserved_blocks()`.
+            can_drain_head = (
+                req.num_preemptions > 0
+                or wait_s > _HARD_STARVATION_SECONDS
+                or (not has_inflight_prefills and wait_s > hold_head_s)
+            )
+            exceeds_hbm = 0 if (fits or can_drain_head) else 1
             if (
                 req.num_preemptions > 0
                 or wait_s > _HARD_STARVATION_SECONDS
-                or (not fits and wait_s > hold_head_s)
+                or (not fits and can_drain_head)
             ):
                 tier = -1
             elif uncached <= 8192 or wait_s > _WARM_STARVATION_SECONDS:

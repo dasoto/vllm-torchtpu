@@ -1157,13 +1157,23 @@ def test_preempted_and_aged_warm_hold_head_without_long_starvation(
     assert list(scheduler.waiting)[0].request_id == "preempted_deep"
 
     # Also verify a non-preempted warm request needing 4 blocks (> 2 free)
-    # yields to `small_fit` at 0s, then holds the head once aged > 15s.
+    # yields to `small_fit` at 0s-20s (and whenever _inflight_prefills is
+    # non-empty), then holds the head once aged > 90s when only decodes run.
     scheduler.finish_requests(["preempted_deep"], RequestStatus.FINISHED_ABORTED)
     aged_warm = _make_real_request("aged_warm", 4 * BLOCK_SIZE, hasher, seed=704)
     scheduler.add_request(aged_warm)
     scheduler._maybe_promote_warm_waiting()
     assert list(scheduler.waiting)[0].request_id == "small_fit"
     aged_warm.arrival_time -= 20.0
+    scheduler._maybe_promote_warm_waiting()
+    assert list(scheduler.waiting)[0].request_id == "small_fit"
+    aged_warm.arrival_time -= 80.0
+    # While an in-flight prefill is active, holding waiting[0] would only
+    # stall fitting warm requests behind _inflight_prefill_reserved_blocks().
+    scheduler._inflight_prefills.add(active)
+    scheduler._maybe_promote_warm_waiting()
+    assert list(scheduler.waiting)[0].request_id == "small_fit"
+    scheduler._inflight_prefills.discard(active)
     scheduler._maybe_promote_warm_waiting()
     assert list(scheduler.waiting)[0].request_id == "aged_warm"
 
