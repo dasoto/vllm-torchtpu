@@ -1168,5 +1168,146 @@ def test_preempted_and_aged_warm_hold_head_without_long_starvation(
     assert list(scheduler.waiting)[0].request_id == "aged_warm"
 
 
+def test_kv_holding_waiting_drains_past_cold_running_and_reorders_fitting_first(
+    shared_model_config,
+):
+    """Completed async KV loads in kv_holding_waiting must reorder fitting
+    requests ahead of non-fitting ones and hold back a cold running prefill
+    without double-counting _inflight_prefills reservations."""
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        num_blocks=11,  # 10 usable blocks
+        max_num_seqs=8,
+        max_num_batched_tokens=BLOCK_SIZE,
+        scheduler_reserve_full_isl=True,
+    )
+    stub_conn = SimpleNamespace(
+        connector_scheduler=SimpleNamespace(
+            config=SimpleNamespace(
+                supports_partial_tail=True,
+                tokens_per_hash=BLOCK_SIZE,
+                alignment_tokens=BLOCK_SIZE,
+            )
+        ),
+        supports_divergent_local_hybrid_hits=False,
+        requires_kv_delivery=False,
+        on_new_request=lambda req: None,
+        get_num_new_matched_tokens=lambda req, n: (0, False),
+        update_state_after_alloc=lambda req, blocks, n: None,
+        build_connector_meta=lambda out: None,
+        request_finished=lambda req, block_ids: (False, None),
+        has_connector_metadata=lambda: False,
+        has_pending_block_frees=lambda: False,
+        has_pending_push_work=lambda: False,
+        reset_cache=lambda: True,
+        get_loaded_kv_cache_group_ids=lambda req: (),
+        get_external_cache_hit_sources=lambda req, n: {},
+    )
+    scheduler.connector = stub_conn
+    # Start a 5-block cold prefill (`1` block computed, `4` blocks remaining in
+    # _inflight_prefills). 9 usable blocks remain free before pinning.
+    req_long = _running_long_prefill(scheduler, hasher, num_tokens=5 * BLOCK_SIZE)
+    assert req_long in scheduler._inflight_prefills
 
+    # Pre-allocate 2 blocks each for `blocked_kh` (needs 3 more blocks -> 5 total)
+    # and `fitting_kh` (needs 1 more block -> 3 total), then pin blocks so only
+    # 2 free blocks remain (watermark=1 -> fitting_kh needs 1+1=2 <= 2, while
+    # blocked_kh needs 3+1=4 > 2, and _inflight_prefill_reserved_blocks >= 4!).
+    blocked_kh = _make_real_request("blocked_kh", 5 * BLOCK_SIZE, hasher, seed=801)
+    fitting_kh = _make_real_request("fitting_kh", 3 * BLOCK_SIZE, hasher, seed=802)
+    for req_k in (blocked_kh, fitting_kh):
+        scheduler.requests[req_k.request_id] = req_k
+        scheduler.kv_cache_manager.allocate_slots(
+            req_k, 2 * BLOCK_SIZE, delay_cache_blocks=True
+        )
+        req_k.num_computed_tokens = 2 * BLOCK_SIZE
+        req_k.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+        scheduler._inflight_prefills.add(req_k)
+        scheduler.finished_recving_kv_req_ids.add(req_k.request_id)
+        scheduler.kv_holding_waiting.add_request(req_k)
+
+    pool = scheduler.kv_cache_manager.block_pool
+    pin_Count = pool.get_num_free_blocks() - 2
+    if pin_Count > 0:
+        pinned = _make_real_request("pin_kh", pin_Count * BLOCK_SIZE, hasher, seed=803)
+        scheduler.kv_cache_manager.allocate_slots(pinned, pin_Count * BLOCK_SIZE)
+    assert pool.get_num_free_blocks() == 2
+
+    out = scheduler.schedule(throttle_prefills=False)
+    assert out.num_scheduled_tokens == {"fitting_kh": BLOCK_SIZE}
+    assert "long" not in out.num_scheduled_tokens
+
+
+def test_async_external_loads_capped_and_do_not_trigger_false_chunk_hold(
+    shared_model_config, monkeypatch
+):
+    """0-compute async external loads must be bounded to _MAX_PRESTAGED_KV_HOLDING
+    and must not cause _select_chunks_to_hold to hold a running prefill chunk."""
+    monkeypatch.setenv("VLLM_TPU_SRPT_PROMOTE_WARM_WAITING", "1")
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        num_blocks=64,
+        max_num_seqs=8,
+        max_num_batched_tokens=2 * BLOCK_SIZE,
+        long_prefill_token_threshold=BLOCK_SIZE,
+        scheduler_reserve_full_isl=True,
+    )
+    stub_conn = SimpleNamespace(
+        connector_scheduler=SimpleNamespace(
+            config=SimpleNamespace(
+                supports_partial_tail=True,
+                tokens_per_hash=BLOCK_SIZE,
+                alignment_tokens=BLOCK_SIZE,
+            )
+        ),
+        supports_divergent_local_hybrid_hits=False,
+        requires_kv_delivery=False,
+        on_new_request=lambda req: None,
+        get_num_new_matched_tokens=lambda req, n: (
+            (2 * BLOCK_SIZE, True) if req.request_id.startswith("ext_") else (0, False)
+        ),
+        update_state_after_alloc=lambda req, blocks, n: None,
+        build_connector_meta=lambda out: None,
+        request_finished=lambda req, block_ids: (False, None),
+        has_connector_metadata=lambda: False,
+        has_pending_block_frees=lambda: False,
+        has_pending_push_work=lambda: False,
+        reset_cache=lambda: True,
+        get_loaded_kv_cache_group_ids=lambda req: (),
+        get_external_cache_hit_sources=lambda req, n: {},
+    )
+    # Seed external hashes for a 2-block prefix, then flush local HBM cache.
+    seed = _make_real_request("seed_cap", 2 * BLOCK_SIZE, hasher, seed=901)
+    scheduler.add_request(seed)
+    scheduler.schedule()
+    scheduler.connector = stub_conn
+    scheduler._record_external_block_hashes(
+        SimpleNamespace(num_scheduled_tokens={"seed_cap": 2 * BLOCK_SIZE})
+    )
+    scheduler.connector = None
+    scheduler.finish_requests("seed_cap", RequestStatus.FINISHED_ABORTED)
+    scheduler.schedule()
+    assert scheduler.reset_prefix_cache(reset_connector=False) is True
+
+    # Start a long cold running prefill (`1` block done, `3` blocks remaining).
+    _running_long_prefill(scheduler, hasher, num_tokens=4 * BLOCK_SIZE)
+    scheduler.connector = stub_conn
+
+    for idx in range(4):
+        scheduler.add_request(
+            _make_real_request(
+                f"ext_{idx}",
+                3 * BLOCK_SIZE,
+                hasher,
+                seed=910 + idx,
+                shared_prefix=list(seed.prompt_token_ids),
+            )
+        )
+
+    out = scheduler.schedule(throttle_prefills=False)
+    # `long` must NOT be held (since ext_0..3 take 0 compute tokens on async load),
+    # and only 2 async loads may enter kv_holding_waiting while 2 remain in waiting!
+    assert out.num_scheduled_tokens == {"long": BLOCK_SIZE}
+    assert len(scheduler.kv_holding_waiting) == 2
+    assert [r.request_id for r in scheduler.waiting] == ["ext_2", "ext_3"]
 
