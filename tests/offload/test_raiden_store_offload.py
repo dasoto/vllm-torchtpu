@@ -4581,6 +4581,102 @@ class TestDcpPartialTailRecall(unittest.TestCase):
         req_status = self.scheduler._req_status[self.request.request_id]
         self.assertEqual(req_status.group_states[0].next_stored_chunk_idx, 2)
 
+    def test_dcp_partial_tail_store_deduplicates_multi_boundary_step_and_skips_interior(
+        self,
+    ):
+        from dataclasses import dataclass
+
+        from vllm.v1.core.sched.output import KVConnectorBlockState
+
+        @dataclass
+        class _FakeSchedulerOutput:
+            scheduled_new_reqs: list
+            scheduled_cached_reqs: object
+            num_scheduled_tokens: dict
+            finished_req_ids: set
+            kv_connector_block_state: KVConnectorBlockState
+
+        req_id = self.request.request_id
+        req_status = self.scheduler._req_status[req_id]
+        req_status.update_offload_keys()
+        req_status.group_states[self.ATTN].block_ids.extend([101, 102, 103])
+        req_status.group_states[self.MAMBA].block_ids.extend(
+            [0] * 18 + [202, 203]
+        )
+
+        def make_sched_out(handoffs):
+            return _FakeSchedulerOutput(
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=SimpleNamespace(
+                    req_ids=[],
+                    new_block_ids=[],
+                    resumed_req_ids=set(),
+                ),
+                num_scheduled_tokens={req_id: self.HASH_BLOCK},
+                finished_req_ids=set(),
+                kv_connector_block_state=KVConnectorBlockState(
+                    req_ids={req_id},
+                    resolve_block_ids=lambda _rid: ([101, 102, 103], [0] * 20),
+                    boundary_state_offloads=handoffs,
+                ),
+            )
+
+        # 1. Intermediate chunked-prefill sub-super-block boundaries (e.g. 1664,
+        # 3328) below prompt_tail_floor (31,616) without shared_prefix_boundary
+        # must NOT bloat host DRAM with transient super-block copies.
+        jobs_interior = self.scheduler._build_partial_tail_store_jobs(
+            make_sched_out({req_id: [(self.MAMBA, 150, 1664), (self.MAMBA, 151, 3328)]})
+        )
+        self.assertEqual(jobs_interior, {})
+
+        # 2. If shared_prefix_boundary marks an interior junction (4,992), keep it.
+        self.request.shared_prefix_boundary = 4992
+        jobs_junction = self.scheduler._build_partial_tail_store_jobs(
+            make_sched_out({req_id: [(self.MAMBA, 152, 4992)]})
+        )
+        junction_keys = {
+            k for jid in jobs_junction for k in self.scheduler._jobs[jid].keys
+        }
+        self.assertEqual(
+            junction_keys,
+            {
+                self._hash_key(self.ATTN, 4992),
+                self._hash_key(self.MAMBA, 4992),
+            },
+        )
+        self.request.shared_prefix_boundary = 0
+
+        # 3. Regression for EngineCore AssertionError (`len(boundaries) == 1`):
+        # When an async load finishes at 31,616 (`_update_waiting_for_remote_kv`
+        # caches 31,616) and resumed prefill computes 31,616 -> 33,280 in the
+        # same schedule() step (plus an aligned 13,312 boundary and a >prompt
+        # decode boundary 34,944), `_build_partial_tail_store_jobs` must keep
+        # the aligned 13,312 Mamba boundary and select ONLY the latest valid
+        # prompt-tail boundary (33,280) without raising AssertionError.
+        jobs_multi = self.scheduler._build_partial_tail_store_jobs(
+            make_sched_out(
+                {
+                    req_id: [
+                        (self.MAMBA, 190, self.DCP_BLOCK),
+                        (self.MAMBA, 202, 31616),
+                        (self.MAMBA, 203, 33280),
+                        (self.MAMBA, 204, 34944),
+                    ]
+                }
+            )
+        )
+        stored_keys = {
+            k for jid in jobs_multi for k in self.scheduler._jobs[jid].keys
+        }
+        self.assertEqual(
+            stored_keys,
+            {
+                self._hash_key(self.MAMBA, self.DCP_BLOCK),
+                self._hash_key(self.ATTN, 33280),
+                self._hash_key(self.MAMBA, 33280),
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -322,20 +322,66 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         ):
             filtered: dict[str, list[tuple[int, int, int]]] = {}
             changed = False
+            block_size = self._partial_tail_block_size
+            tokens_per_hash = self.config.tokens_per_hash
             for req_id, entries in handoffs.items():
                 req_status = self._req_status.get(req_id)
                 if req_status is None:
+                    changed = True
                     continue
                 req = req_status.req
                 prompt_cap = min(
                     req.num_prompt_tokens,
                     req_status.max_offload_tokens or req.num_prompt_tokens,
                 )
-                kept = [
+                # Under DCP > 1, FullAttention chunks span `block_size` tokens
+                # (e.g. 13,312 = 8 * 1,664) while Mamba align blocks emit a
+                # hand-off every `tokens_per_hash` (1,664) tokens. Keep:
+                # 1. Super-block-aligned hand-offs (`boundary % block_size == 0`)
+                #    so `_build_aligned_boundary_store_jobs` stores the Mamba
+                #    state matching each complete FullAttention offload chunk.
+                # 2. At most ONE sub-super-block partial-tail boundary (matching
+                #    upstream's `len(boundaries) == 1` invariant), restricted to
+                #    the prompt's reusable tail window (or an explicit
+                #    `shared_prefix_boundary` junction) so intermediate chunked
+                #    prefill steps neither amplify host DRAM / PCIe stores by
+                #    `dcp_world_size`x nor crash when an async-load completion
+                #    and a resumed prefill chunk emit two sub-super-block
+                #    boundaries in the same step.
+                prompt_tail = (prompt_cap // tokens_per_hash) * tokens_per_hash
+                prompt_tail_floor = (
+                    prompt_tail - tokens_per_hash
+                    if prompt_tail > 0 and prompt_cap % tokens_per_hash == 0
+                    else prompt_tail
+                )
+                aligned = [e for e in entries if e[2] % block_size == 0]
+                partial_candidates = [
                     e
                     for e in entries
-                    if e[2] % self._partial_tail_block_size == 0 or e[2] <= prompt_cap
+                    if e[2] % block_size != 0
+                    and 0 < e[2] <= prompt_cap
+                    and (
+                        e[2] >= prompt_tail_floor
+                        or (
+                            req.shared_prefix_boundary > 0
+                            and e[2] == req.shared_prefix_boundary
+                        )
+                    )
                 ]
+                chosen_partial: list[tuple[int, int, int]] = []
+                if partial_candidates:
+                    by_boundary: dict[int, dict[int, tuple[int, int, int]]] = {}
+                    for e in partial_candidates:
+                        by_boundary.setdefault(e[2], {})[e[0]] = e
+                    valid_boundaries = [
+                        b
+                        for b, group_map in by_boundary.items()
+                        if self._cow_source_groups.issubset(group_map)
+                    ]
+                    if valid_boundaries:
+                        best_boundary = max(valid_boundaries)
+                        chosen_partial = list(by_boundary[best_boundary].values())
+                kept = aligned + chosen_partial
                 if len(kept) != len(entries):
                     changed = True
                 if kept:
