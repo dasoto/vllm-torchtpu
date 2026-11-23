@@ -370,6 +370,7 @@ def _sharded_runai_weights_iterator(
             disable=not enable_tqdm(use_tqdm_on_load),
             mininterval=2,
         )
+        yielded_names: set[str] = set()
         try:
             for tensor_meta in zero_size_tensors:
                 # create_torch_tensor returns torch.empty for zero-element
@@ -378,22 +379,62 @@ def _sharded_runai_weights_iterator(
                     tensor_meta.name,
                     sp.create_torch_tensor(memoryview(b""), tensor_meta),
                 )
+                yielded_names.add(tensor_meta.name)
                 if finisher is not None:
                     finisher.consumed(tensor_meta.name)
                 progress.update(1)
-            for yielded, (request_id, chunk_index, buffer) in enumerate(
-                fs.get_chunks(), start=1
-            ):
-                tensor_meta = tensors_by_request[request_id][chunk_index]
-                yield (
-                    tensor_meta.name,
-                    sp.create_torch_tensor(buffer, tensor_meta).clone(),
-                )
-                if finisher is not None:
-                    finisher.consumed(tensor_meta.name)
-                progress.update(1)
-                if sync_every and yielded % sync_every == 0:
-                    _device_sync()
+
+            max_attempts = 5
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    if attempt == 1:
+                        active_fs = fs
+                        active_ctx = None
+                    else:
+                        import time as _time
+
+                        _time.sleep(2.0 * attempt)
+                        active_ctx = SafetensorsStreamer()
+                        active_fs = active_ctx.__enter__().file_streamer
+                        active_fs.stream_files(
+                            requests,
+                            credentials=None,
+                            device="cpu",
+                            is_distributed=False,
+                        )
+                    try:
+                        for yielded, (request_id, chunk_index, buffer) in enumerate(
+                            active_fs.get_chunks(), start=1
+                        ):
+                            tensor_meta = tensors_by_request[request_id][chunk_index]
+                            if tensor_meta.name in yielded_names:
+                                continue
+                            yield (
+                                tensor_meta.name,
+                                sp.create_torch_tensor(buffer, tensor_meta).clone(),
+                            )
+                            yielded_names.add(tensor_meta.name)
+                            if finisher is not None:
+                                finisher.consumed(tensor_meta.name)
+                            progress.update(1)
+                            if sync_every and len(yielded_names) % sync_every == 0:
+                                _device_sync()
+                    finally:
+                        if active_ctx is not None:
+                            active_ctx.__exit__(None, None, None)
+                    break
+                except ValueError as exc:
+                    if "libstreamer" not in str(exc) or attempt >= max_attempts:
+                        raise
+                    logger.warning(
+                        "[sharded-ep-load] Transient libstreamer error after %d/%d "
+                        "tensors on attempt %d/%d (%s); retrying remaining tensors...",
+                        len(yielded_names),
+                        kept,
+                        attempt,
+                        max_attempts,
+                        exc,
+                    )
         finally:
             progress.close()
         if sync_every:
