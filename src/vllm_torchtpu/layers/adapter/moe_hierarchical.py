@@ -31,6 +31,38 @@ def hierarchical_split_or_none() -> tuple[int, int, int, int] | None:
     ``None`` is the safe answer everywhere: the caller keeps vLLM's own
     parallel config and the model runs exactly as it does today.
     """
+    etp_size = envs.TPU_MOE_ETP_SIZE
+    if etp_size > 1:
+        from vllm.distributed import (
+            get_ep_group,
+            get_tensor_model_parallel_world_size,
+        )
+
+        tp_world_size = get_tensor_model_parallel_world_size()
+        ep_group = get_ep_group()
+        ep_world_size = int(ep_group.world_size)
+        ep_group_rank = int(ep_group.rank_in_group)
+        if (
+            tp_world_size < etp_size
+            or tp_world_size % etp_size != 0
+            or ep_world_size < etp_size
+            or ep_world_size % etp_size != 0
+        ):
+            logger.warning_once(
+                "TPU_MOE_ETP_SIZE=%d must divide both TP world size (%d) and "
+                "EP world size (%d); falling back to flat expert parallelism.",
+                etp_size,
+                tp_world_size,
+                ep_world_size,
+            )
+            return None
+        return (
+            ep_world_size // etp_size,
+            ep_group_rank // etp_size,
+            etp_size,
+            ep_group_rank % etp_size,
+        )
+
     if not envs.TPU_MOE_HIERARCHICAL_EP:
         return None
 

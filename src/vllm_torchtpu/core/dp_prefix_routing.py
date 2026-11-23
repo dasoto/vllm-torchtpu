@@ -100,11 +100,13 @@ class _DPPrefixDirectory:
         self._last_decay_t = cur
         if dt <= 0.0:
             return
-        drained = dt * _PREFILL_DRAIN_TOKENS_PER_SEC
+        drained_per_engine = (
+            dt * _PREFILL_DRAIN_TOKENS_PER_SEC * (16.0 / max(self.num_engines, 1))
+        )
         for idx in range(self.num_engines):
             prev = self._engine_prefill_backlog[idx]
             if prev > 0.0:
-                self._engine_prefill_backlog[idx] = max(0.0, prev - drained)
+                self._engine_prefill_backlog[idx] = max(0.0, prev - drained_per_engine)
 
     def cached_tokens_by_engine(self, digests: list[bytes]) -> list[int]:
         """Return deepest matched prefix length (in tokens) for each DP engine."""

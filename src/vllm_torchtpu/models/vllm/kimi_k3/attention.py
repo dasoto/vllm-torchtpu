@@ -82,6 +82,7 @@ def kda_state_dtype(vllm_config: VllmConfig) -> tuple[torch.dtype, torch.dtype]:
     _, recurrent_dtype = MambaStateDtypeCalculator.kda_state_dtype(
         vllm_config.model_config.dtype,
         vllm_config.cache_config.mamba_cache_dtype,
+        getattr(vllm_config.cache_config, "mamba_ssm_cache_dtype", "auto"),
     )
     return torch.float32, recurrent_dtype
 

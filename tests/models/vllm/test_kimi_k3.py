@@ -816,6 +816,18 @@ def test_kda_state_dtype_reads_model_and_cache_config() -> None:
     assert conv_dtype == torch.float32
     assert recurrent_dtype == torch.float32
 
+    vllm_config_bf16 = SimpleNamespace(
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+        cache_config=SimpleNamespace(
+            mamba_cache_dtype="auto", mamba_ssm_cache_dtype="bfloat16"
+        ),
+    )
+    conv_dtype_bf16, recurrent_dtype_bf16 = kimi_attention.kda_state_dtype(
+        vllm_config_bf16
+    )
+    assert conv_dtype_bf16 == torch.float32
+    assert recurrent_dtype_bf16 == torch.bfloat16
+
 
 def test_load_a_log_flattens_legacy_layout_and_shards_by_rank(
     monkeypatch: pytest.MonkeyPatch,

@@ -108,6 +108,7 @@ if TYPE_CHECKING:
     TPU_GDN_PREFILL_CHECKPOINT: bool = True
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
+    TPU_MOE_ETP_SIZE: int = 0
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     TPU_MOE_EP_HIER_RS: str = "off"
     TPU_MOE_EP_HIER_RS_FP8_STATIC_SCALE: float | None = None
@@ -223,6 +224,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
     VLLM_TPU_PREFILL_CADENCE_NO_ESCAPE: bool = False
     VLLM_TPU_SRPT_PROMOTE_WARM_WAITING: bool = False
+    VLLM_TPU_SHARED_PREFIX_CHECKPOINT: bool = False
     VLLM_TPU_MOE_EP_MAX_ROUTES: int = 0
     VLLM_TPU_MEGAKERNEL: str = ""
     VLLM_TPU_EXPERIMENTAL_USE_RUST: bool = False
@@ -874,6 +876,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # weight-bandwidth bound and the per-device expert load is badly
     # imbalanced. See K3_HIERARCHICAL_EP_PLAN.md.
     "TPU_MOE_HIERARCHICAL_EP": env_bool("TPU_MOE_HIERARCHICAL_EP"),
+    # Explicit tensor-parallel width within each expert-parallel shard for
+    # hierarchical MoE on single-core TPUs (e.g. 2 to pair adjacent TPU v6e
+    # chips into EP = (DP * TP) // 2 x ETP = 2). 0 uses get_chip_topology().
+    "TPU_MOE_ETP_SIZE": env_nonnegative_int("TPU_MOE_ETP_SIZE", 0),
     # MoE router top-k implementation: "rowmax" (default) is the sort-free
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
     "TPU_MOE_ROUTER_TOPK": env_with_choices(
@@ -1376,6 +1382,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the waiting queue ahead of cold uncached prompts (with age anti-starvation).
     "VLLM_TPU_SRPT_PROMOTE_WARM_WAITING": env_bool(
         "VLLM_TPU_SRPT_PROMOTE_WARM_WAITING", default=False
+    ),
+    # SrptPrefillScheduler: automatically detect and checkpoint sub-super-block
+    # shared prompt prefixes (e.g. shared system prompts under hybrid Mamba + DCP)
+    # and pin the resulting junction blocks in local HBM for 0-ms reuse.
+    "VLLM_TPU_SHARED_PREFIX_CHECKPOINT": env_bool(
+        "VLLM_TPU_SHARED_PREFIX_CHECKPOINT", default=False
     ),
     # Optional upper bound on per-shard SparseCore ragged_gather_v2 / gmm_v2
     # routed rows under EP (0 keeps the exact num_tokens * local_num_experts

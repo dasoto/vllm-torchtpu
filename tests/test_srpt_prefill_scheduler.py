@@ -1515,3 +1515,154 @@ def test_cross_rank_decode_hold_starts_zero_compute_async_load_without_prefillin
     assert [r.request_id for r in scheduler.waiting] == ["cold_w"]
 
 
+def test_shared_prefix_checkpoint_pins_hybrid_dcp_system_prompt(
+    shared_model_config, monkeypatch
+):
+    """Under hybrid FullAttention (DCP=8, manager block 8*256=2048) + Mamba align
+    (block 256), two Turn-0 requests sharing a 1,600-token system prompt (< 2048)
+    automatically checkpoint and pin the 1,536-token junction in HBM so all
+    subsequent Turn-0 requests hit 1,536 cached tokens on arrival."""
+    from vllm.v1.kv_cache_interface import MambaSpec
+    from vllm.v1.outputs import ModelRunnerOutput
+
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(envs, "VLLM_TPU_SHARED_PREFIX_CHECKPOINT", True)
+    hash_bs = 128
+    dcp_size = 12
+    super_bs = hash_bs * dcp_size  # 1536 (< shared_model_config.max_model_len=2048)
+    num_blocks = 64
+
+    vllm_config = VllmConfig(
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=8,
+            max_num_batched_tokens=2048,
+            max_model_len=2048,
+            enable_chunked_prefill=True,
+            is_encoder_decoder=False,
+            watermark=0.0,
+            async_scheduling=True,
+            policy="fcfs",
+        ),
+        model_config=shared_model_config,
+        cache_config=CacheConfig(
+            block_size=hash_bs,
+            mamba_block_size=hash_bs,
+            mamba_cache_mode="align",
+            gpu_memory_utilization=0.9,
+            cache_dtype="auto",
+            enable_prefix_caching=True,
+        ),
+        parallel_config=ParallelConfig(),
+        device_config=DeviceConfig(device="cpu"),
+    )
+    vllm_config.parallel_config.decode_context_parallel_size = dcp_size
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["attn0"],
+                FullAttentionSpec(
+                    block_size=hash_bs,
+                    num_kv_heads=1,
+                    head_size=64,
+                    dtype=torch.float16,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba0"],
+                MambaSpec(
+                    shapes=((3, 128), (2, 64, 64)),
+                    dtypes=(torch.float32, torch.float32),
+                    block_size=hash_bs,
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    vllm_config.cache_config.num_gpu_blocks = num_blocks
+    register_all_kvcache_specs(vllm_config)
+    scheduler = SrptPrefillScheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        structured_output_manager=StructuredOutputManager(vllm_config),
+        block_size=super_bs,
+        hash_block_size=hash_bs,
+    )
+    assert scheduler.shared_prefix_checkpoint_enabled is True
+    assert scheduler.hash_block_size == hash_bs
+    assert scheduler.block_size == super_bs
+
+    init_none_hash(sha256)
+    hasher = get_request_block_hasher(hash_bs, sha256)
+
+    def step_and_complete(sched):
+        out = sched.schedule()
+        req_ids = list(out.num_scheduled_tokens.keys())
+        runner_out = ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+            sampled_token_ids=[
+                [10]
+                if sched.requests[rid].num_computed_tokens
+                >= sched.requests[rid].num_prompt_tokens
+                else []
+                for rid in req_ids
+            ],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[None] * len(req_ids),
+        )
+        sched.update_from_output(out, runner_out)
+        return out
+
+    def run_prefill_steps(sched, rid: str):
+        outs = []
+        while (
+            rid in sched.requests
+            and sched.requests[rid].num_computed_tokens
+            < sched.requests[rid].num_prompt_tokens
+        ):
+            outs.append(step_and_complete(sched))
+            assert len(outs) <= 8
+        return outs
+
+    # Shared system prompt of 1,100 tokens -> 8 full 128-token hashes = 1,024 tokens (< 1,536).
+    sys_prompt = [900_000 + i for i in range(1100)]
+
+    req1 = _make_real_request("t0_1", 1920, hasher, seed=1, shared_prefix=sys_prompt)
+    scheduler.add_request(req1)
+    outs1 = run_prefill_steps(scheduler, "t0_1")
+    assert sum(o.num_scheduled_tokens.get("t0_1", 0) for o in outs1) == 1920
+    scheduler.finish_requests("t0_1", RequestStatus.FINISHED_ABORTED)
+    scheduler.schedule()
+
+    # Second Turn-0 request detects the 1,024-token shared system prefix, stops at 1,024,
+    # and on the next step stages FullAttention CoW + publishes the pinned junction.
+    req2 = _make_real_request("t0_2", 1920, hasher, seed=2, shared_prefix=sys_prompt)
+    scheduler.add_request(req2)
+    outs2 = run_prefill_steps(scheduler, "t0_2")
+    assert outs2[0].num_scheduled_tokens["t0_2"] == 1024
+    assert outs2[1].kv_cache_block_copies is not None
+    assert len(outs2[1].kv_cache_block_copies) == 1
+    assert sum(o.num_scheduled_tokens.get("t0_2", 0) for o in outs2) == 1920
+    assert len(scheduler._pinned_junction_hashes) == 1
+    scheduler.finish_requests("t0_2", RequestStatus.FINISHED_ABORTED)
+    scheduler.schedule()
+
+    # Third Turn-0 request immediately gets a 1,024-token local HBM hit (only 1920 - 1024 = 896 scheduled)!
+    req3 = _make_real_request("t0_3", 1920, hasher, seed=3, shared_prefix=sys_prompt)
+    scheduler.add_request(req3)
+    outs3 = run_prefill_steps(scheduler, "t0_3")
+    assert sum(o.num_scheduled_tokens.get("t0_3", 0) for o in outs3) == 1920 - 1024
+    scheduler.finish_requests("t0_3", RequestStatus.FINISHED_ABORTED)
+    scheduler.schedule()
+
+    # Clean reset releases all pinned junction blocks with zero leaks.
+    assert scheduler.reset_prefix_cache() is True
+    assert (
+        scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == num_blocks - 1
+    )
+
+

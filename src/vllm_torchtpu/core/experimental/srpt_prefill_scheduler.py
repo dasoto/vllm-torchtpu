@@ -68,7 +68,7 @@ Select with ``--scheduler-cls``
 
 import math
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from itertools import chain, islice
 from typing import Any, cast
 
@@ -77,6 +77,7 @@ from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.metrics.stats import KV_FETCH_WAITING_TO_START
 from vllm.v1.outputs import ModelRunnerOutput
@@ -98,6 +99,9 @@ _WARM_FOLLOWUP_MIN_HIT_TOKENS = 8192
 _WARM_FOLLOWUP_MAX_UNCACHED_TOKENS = 32768
 _MAX_EXTERNAL_BLOCK_HASHES = 65536
 _MAX_PRESTAGED_KV_HOLDING = 2
+_MAX_RECENT_PROMPT_PREFIXES = 128
+_MAX_PINNED_JUNCTIONS = 4
+_MIN_SHARED_PREFIX_TOKENS = 1024
 
 
 class SrptPrefillScheduler(AsyncScheduler):
@@ -120,6 +124,26 @@ class SrptPrefillScheduler(AsyncScheduler):
         self.attn_tile_tokens = max(envs.VLLM_TPU_SRPT_ATTN_TILE_TOKENS, 1)
         self.cadence_no_escape = envs.VLLM_TPU_PREFILL_CADENCE_NO_ESCAPE
         self.promote_warm_waiting = envs.VLLM_TPU_SRPT_PROMOTE_WARM_WAITING
+        coordinator = getattr(self.kv_cache_manager, "coordinator", None)
+        self.shared_prefix_checkpoint_enabled = bool(
+            envs.VLLM_TPU_SHARED_PREFIX_CHECKPOINT
+            and getattr(self, "mamba_partial_cache_hit", False)
+            and coordinator is not None
+            and getattr(coordinator, "num_reprefillable_tokens", 0) == 0
+        )
+        if self.shared_prefix_checkpoint_enabled and coordinator is not None:
+            self.mamba_shared_prefix_checkpoint = True
+            for mgr in coordinator.single_type_managers:
+                if hasattr(mgr, "shared_prefix_checkpoint"):
+                    mgr.shared_prefix_checkpoint = True
+        self._recent_prompt_prefixes: OrderedDict[str, tuple[Any, ...]] = OrderedDict()
+        self._inflight_junctions: dict[str, tuple[int, Any]] = {}
+        self._ready_fa_junctions: dict[str, tuple[int, Any, list[tuple[Any, Any]]]] = {}
+        self._deferred_fa_junction_pubs: deque[
+            tuple[int, Request, list[tuple[Any, Any]], int, Any]
+        ] = deque()
+        self._pinned_junction_hashes: set[Any] = set()
+        self._pinned_junction_blocks: list[tuple[Any, Any]] = []
         # Whether another DP rank decoded in the last step the runner reported,
         # and whether the cap applies to the step being scheduled.
         self._other_rank_decoding = False
@@ -137,12 +161,13 @@ class SrptPrefillScheduler(AsyncScheduler):
         logger.info(
             "SrptPrefillScheduler active (max_consecutive_holds=%d, "
             "attn_work_cap=%d, attn_tile_tokens=%d, cadence_no_escape=%s, "
-            "promote_warm_waiting=%s)",
+            "promote_warm_waiting=%s, shared_prefix_checkpoint=%s)",
             self.max_consecutive_holds,
             self.attn_work_cap,
             self.attn_tile_tokens,
             self.cadence_no_escape,
             self.promote_warm_waiting,
+            self.shared_prefix_checkpoint_enabled,
         )
 
     def _record_external_block_hashes(self, output: SchedulerOutput) -> None:
@@ -286,9 +311,25 @@ class SrptPrefillScheduler(AsyncScheduler):
                 return False, local_hit, est_hit
         return True, local_hit, est_hit
 
+    def _release_pinned_junction_blocks(self) -> None:
+        for _, (_, _, mamba_pins) in list(self._ready_fa_junctions.items()):
+            for pool, blk in mamba_pins:
+                if not blk.is_null and blk.ref_cnt > 0:
+                    pool.free_blocks([blk])
+        self._ready_fa_junctions.clear()
+        self._inflight_junctions.clear()
+        self._deferred_fa_junction_pubs.clear()
+        for pool, blk in self._pinned_junction_blocks:
+            if not blk.is_null and blk.ref_cnt > 0:
+                pool.free_blocks([blk])
+        self._pinned_junction_blocks.clear()
+        self._pinned_junction_hashes.clear()
+        self._recent_prompt_prefixes.clear()
+
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
+        self._release_pinned_junction_blocks()
         ok = super().reset_prefix_cache(
             reset_running_requests=reset_running_requests,
             reset_connector=reset_connector,
@@ -296,6 +337,190 @@ class SrptPrefillScheduler(AsyncScheduler):
         if ok and reset_connector:
             self._external_block_hashes.clear()
         return ok
+
+    def _detect_shared_prefix_boundary(
+        self,
+        request: Request,
+        num_local: int,
+        max_cache_hit_length: int | None = None,
+    ) -> int:
+        if (
+            not self.shared_prefix_checkpoint_enabled
+            or len(self._pinned_junction_hashes) >= _MAX_PINNED_JUNCTIONS
+            or request.skip_reading_prefix_cache
+            or not request.block_hashes
+        ):
+            return 0
+        hash_bs = int(getattr(self, "hash_block_size", 0) or 0)
+        super_bs = int(self.block_size or 0)
+        if hash_bs <= 0 or super_bs <= hash_bs or num_local % super_bs != 0:
+            return 0
+        max_hashes = min(len(request.block_hashes), 2 * (super_bs // hash_bs))
+        min_hashes = max(_MIN_SHARED_PREFIX_TOKENS // hash_bs, 1)
+        if max_hashes < min_hashes:
+            return 0
+        prefix = tuple(request.block_hashes[:max_hashes])
+        best_lcp = 0
+        for other_id, other_prefix in self._recent_prompt_prefixes.items():
+            if other_id == request.request_id:
+                continue
+            limit = min(len(prefix), len(other_prefix))
+            if limit <= best_lcp:
+                continue
+            lcp = 0
+            while lcp < limit and prefix[lcp] == other_prefix[lcp]:
+                lcp += 1
+            if lcp > best_lcp:
+                best_lcp = lcp
+
+        if request.request_id in self._recent_prompt_prefixes:
+            self._recent_prompt_prefixes.move_to_end(request.request_id)
+        else:
+            if len(self._recent_prompt_prefixes) >= _MAX_RECENT_PROMPT_PREFIXES:
+                self._recent_prompt_prefixes.popitem(last=False)
+        self._recent_prompt_prefixes[request.request_id] = prefix
+
+        if best_lcp < min_hashes:
+            return 0
+        lcp_tokens = best_lcp * hash_bs
+        if max_cache_hit_length is not None and lcp_tokens > max_cache_hit_length:
+            lcp_tokens = (max_cache_hit_length // hash_bs) * hash_bs
+        if (
+            lcp_tokens <= num_local
+            or lcp_tokens < _MIN_SHARED_PREFIX_TOKENS
+            or lcp_tokens >= request.num_prompt_tokens
+            or lcp_tokens % super_bs == 0
+        ):
+            return 0
+        junction_hash = prefix[lcp_tokens // hash_bs - 1]
+        if junction_hash in self._pinned_junction_hashes:
+            return 0
+        active_hashes = (
+            {h for _, h in self._inflight_junctions.values()}
+            | {h for _, h, _ in self._ready_fa_junctions.values()}
+            | {h for _, _, _, _, h in self._deferred_fa_junction_pubs}
+        )
+        if junction_hash in active_hashes:
+            return 0
+        self._inflight_junctions[request.request_id] = (lcp_tokens, junction_hash)
+        return lcp_tokens
+
+    def _get_local_prefix_cache_hit(
+        self, request: Request, max_cache_hit_length: int | None = None
+    ) -> tuple[KVCacheBlocks, int, int, bool]:
+        blocks, num_local, shared_prefix_boundary, hit_diverged = (
+            super()._get_local_prefix_cache_hit(request, max_cache_hit_length)
+        )
+        if (
+            self.shared_prefix_checkpoint_enabled
+            and self._in_schedule
+            and shared_prefix_boundary == 0
+            and request.num_computed_tokens == 0
+        ):
+            shared_prefix_boundary = self._detect_shared_prefix_boundary(
+                request, num_local, max_cache_hit_length
+            )
+        return blocks, num_local, shared_prefix_boundary, hit_diverged
+
+    def _stage_ready_fa_junctions(self, prev_sched_seq: int) -> None:
+        if not self._ready_fa_junctions:
+            return
+        coordinator = self.kv_cache_manager.coordinator
+        fa_mgrs = [
+            mgr
+            for mgr in coordinator.single_type_managers
+            if isinstance(mgr, FullAttentionManager)
+            and mgr.kv_cache_spec.prefix_cacheable
+        ]
+        for req_id, (j_tokens, j_hash, mamba_pins) in list(
+            self._ready_fa_junctions.items()
+        ):
+            req = self.requests.get(req_id)
+            if (
+                req is None
+                or req.status != RequestStatus.RUNNING
+                or req.num_computed_tokens != j_tokens
+            ):
+                for pool, blk in mamba_pins:
+                    if not blk.is_null and blk.ref_cnt > 0:
+                        pool.free_blocks([blk])
+                self._ready_fa_junctions.pop(req_id, None)
+                continue
+            free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
+            watermark = self.kv_cache_manager.watermark_blocks
+            if free_blocks < watermark + len(fa_mgrs) + 4:
+                continue
+            staged_fa: list[tuple[Any, Any]] = []
+            valid = True
+            for fa_mgr in fa_mgrs:
+                b_idx = j_tokens // fa_mgr.block_size
+                req_blocks = fa_mgr.req_to_blocks.get(req_id, ())
+                if b_idx >= len(req_blocks) or req_blocks[b_idx].is_null:
+                    valid = False
+                    break
+            if not valid:
+                for pool, blk in mamba_pins:
+                    if not blk.is_null and blk.ref_cnt > 0:
+                        pool.free_blocks([blk])
+                req.shared_prefix_boundary = 0
+                self._ready_fa_junctions.pop(req_id, None)
+                continue
+            for fa_mgr in fa_mgrs:
+                b_idx = j_tokens // fa_mgr.block_size
+                source_block = fa_mgr.req_to_blocks[req_id][b_idx]
+                cow_block = fa_mgr.block_pool.get_new_blocks(1)[0]
+                if fa_mgr.records_new_block_ids:
+                    fa_mgr.new_block_ids.append(cow_block.block_id)
+                # take_kv_cache_block_copies() retains both endpoints and
+                # releases 1 ref from each at `prev_sched_seq + 1`. Add 1 ref
+                # to `source_block` so `req` keeps its ref, and 1 extra ref to
+                # `cow_block` so `cow_block` stays pinned (ref_cnt == 1) in HBM.
+                source_block.ref_cnt += 1
+                cow_block.ref_cnt += 1
+                fa_mgr._pending_cow_copies.append((source_block, cow_block))
+                self._pinned_junction_blocks.append((fa_mgr.block_pool, cow_block))
+                staged_fa.append((fa_mgr, cow_block))
+            self._pinned_junction_blocks.extend(mamba_pins)
+            req.shared_prefix_boundary = 0
+            self._ready_fa_junctions.pop(req_id, None)
+            self._deferred_fa_junction_pubs.append(
+                (prev_sched_seq + 1, req, staged_fa, j_tokens, j_hash)
+            )
+
+    def _capture_inflight_junctions(self, output: SchedulerOutput) -> None:
+        if not self._inflight_junctions:
+            return
+        coordinator = self.kv_cache_manager.coordinator
+        for req_id, (j_tokens, j_hash) in list(self._inflight_junctions.items()):
+            req = self.requests.get(req_id)
+            if (
+                req is None
+                or req.status != RequestStatus.RUNNING
+                or req.num_computed_tokens > j_tokens
+            ):
+                self._inflight_junctions.pop(req_id, None)
+                continue
+            if (
+                req.num_computed_tokens == j_tokens
+                and output.num_scheduled_tokens.get(req_id, 0) > 0
+            ):
+                mamba_pins: list[tuple[Any, Any]] = []
+                for mgr in coordinator.single_type_managers:
+                    if (
+                        getattr(mgr, "mamba_cache_mode", None) == "align"
+                        and j_tokens % mgr.block_size == 0
+                    ):
+                        m_idx = j_tokens // mgr.block_size - 1
+                        m_blocks = mgr.req_to_blocks.get(req_id, ())
+                        if (
+                            0 <= m_idx < len(m_blocks)
+                            and not m_blocks[m_idx].is_null
+                            and m_blocks[m_idx].block_hash is not None
+                        ):
+                            mgr.block_pool.touch([m_blocks[m_idx]])
+                            mamba_pins.append((mgr.block_pool, m_blocks[m_idx]))
+                self._inflight_junctions.pop(req_id, None)
+                self._ready_fa_junctions[req_id] = (j_tokens, j_hash, mamba_pins)
 
     def _maybe_promote_warm_waiting(self, throttle_prefills: bool = False) -> None:
         """Promote fitting ready requests ahead of blocked ones in SRPT order."""
@@ -617,6 +842,9 @@ class SrptPrefillScheduler(AsyncScheduler):
         self._attn_work = 0.0
         self._attn_prefill_scheduled = False
         self._attn_capped.clear()
+        prev_sched_seq = getattr(self, "sched_step_seq", 0)
+        if self.shared_prefix_checkpoint_enabled and not cross_rank_decode_hold:
+            self._stage_ready_fa_junctions(prev_sched_seq)
         self._in_schedule = True
         try:
             output = super().schedule(throttle_prefills)
@@ -650,6 +878,8 @@ class SrptPrefillScheduler(AsyncScheduler):
                 for req_rest in reversed(restored):
                     self.waiting.prepend_request(req_rest)
 
+        if self.shared_prefix_checkpoint_enabled:
+            self._capture_inflight_junctions(output)
         self._record_external_block_hashes(output)
 
         # One KV cache block of the main attention group; not self.block_size,
@@ -707,7 +937,46 @@ class SrptPrefillScheduler(AsyncScheduler):
         decoding = getattr(model_runner_output, "other_rank_decoding", None)
         if decoding is not None:
             self._other_rank_decoding = decoding
-        return super().update_from_output(scheduler_output, model_runner_output)
+        res = super().update_from_output(scheduler_output, model_runner_output)
+        if self._deferred_fa_junction_pubs:
+            proc_seq = getattr(self, "processed_step_seq", 0)
+            defer_free = bool(getattr(self, "defer_block_free", False))
+            completed_dst_ids = {
+                c.dst_block_id for c in (scheduler_output.kv_cache_block_copies or ())
+            }
+            remaining_pubs: deque[
+                tuple[int, Request, list[tuple[Any, Any]], int, Any]
+            ] = deque()
+            for entry in self._deferred_fa_junction_pubs:
+                fence_seq, req_pub, staged_fa, j_tokens, j_hash = entry
+                retired = (defer_free and proc_seq >= fence_seq) or (
+                    bool(completed_dst_ids)
+                    and all(
+                        cow_block.block_id in completed_dst_ids
+                        for _, cow_block in staged_fa
+                    )
+                )
+                if not retired:
+                    remaining_pubs.append(entry)
+                    continue
+                for fa_mgr, cow_block in staged_fa:
+                    if not cow_block.is_null and cow_block.ref_cnt > 0:
+                        fa_mgr.block_pool.cache_partial_block(
+                            request=req_pub,
+                            block=cow_block,
+                            num_tokens=j_tokens,
+                            kv_cache_group_id=fa_mgr.kv_cache_group_id,
+                            block_size=fa_mgr.block_size,
+                        )
+                self._pinned_junction_hashes.add(j_hash)
+                logger.info(
+                    "SrptPrefillScheduler: pinned shared prefix junction at %d "
+                    "tokens in HBM (%d pinned junctions).",
+                    j_tokens,
+                    len(self._pinned_junction_hashes),
+                )
+            self._deferred_fa_junction_pubs = remaining_pubs
+        return res
 
     def _attn_cap_tokens(
         self, context: int, num_new_tokens: int, work: float, prefill_scheduled: bool

@@ -26,9 +26,11 @@ from vllm.config import VllmConfig
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.gdn_pool_layout import (
     DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
+    DEFAULT_POOLED_GDN_SSM_STATE_DTYPE,
     derive_pooled_gdn_state_layout,
     pooled_gdn_conv_state_bytes,
     pooled_gdn_ssm_state_bytes,
+    pooled_gdn_state_dtypes,
     pooled_gdn_state_itemsize,
 )
 from vllm_torchtpu.kernels import pool_adapters
@@ -548,6 +550,7 @@ def _pooled_kda_core(
     pool_block_tokens: int,
     conv_shard_heads: int | None = None,
     num_spec_tokens: int = 0,
+    ssm_state_dtype: str = DEFAULT_POOLED_GDN_SSM_STATE_DTYPE,
 ) -> tuple[jax.Array, jax.Array]:
     num_reqs = state_indices.shape[0]
     window = num_spec_tokens + 1
@@ -580,10 +583,15 @@ def _pooled_kda_core(
     # the only conv dtype the fused kernel accepts.
     conv_dtype = jnp.dtype(DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.removeprefix("torch."))
     conv_elem_bytes = pooled_gdn_state_itemsize(DEFAULT_POOLED_GDN_CONV_STATE_DTYPE)
+    ssm_dtype = jnp.dtype(ssm_state_dtype.removeprefix("torch."))
+    ssm_elem_bytes = pooled_gdn_state_itemsize(ssm_state_dtype)
     tok_bytes = math.prod(pool.shape[2:]) * jnp.dtype(pool.dtype).itemsize
     layout = derive_pooled_gdn_state_layout(
         ssm_bytes=pooled_gdn_ssm_state_bytes(
-            num_v_heads=num_heads, head_k_dim=head_dim, head_v_dim=head_dim
+            num_v_heads=num_heads,
+            head_k_dim=head_dim,
+            head_v_dim=head_dim,
+            dtype=ssm_state_dtype,
         ),
         conv_bytes=pooled_gdn_conv_state_bytes(
             kernel_size=kernel_size, conv_dim=3 * num_heads * head_dim
@@ -622,20 +630,22 @@ def _pooled_kda_core(
             f"{layout.required_tokens} > {manager_rows}"
         )
 
-    # SSM region [0, ssm_tokens): f32 view with one head_dim-wide lane group
-    # per typed row, so the leading H * D rows are exactly the state.
+    # SSM region [0, ssm_tokens): typed view with one head_dim-wide lane group
+    # per typed row, upcast to fp32 for GDN v3 execution.
     ssm_gathered = pool_adapters.gather_region(
         pool,
         state_indices,
         tok0=0,
         ntok=layout.ssm_tokens,
-        out_dtype=jnp.float32,
+        out_dtype=ssm_dtype,
         out_lanes=head_dim,
         split=split,
     )
     ssm_rows = num_heads * head_dim
-    ssm_local = ssm_gathered[:, :ssm_rows, :].reshape(
-        num_reqs, num_heads, head_dim, head_dim
+    ssm_local = (
+        ssm_gathered[:, :ssm_rows, :]
+        .reshape(num_reqs, num_heads, head_dim, head_dim)
+        .astype(jnp.float32)
     )
 
     # Stage-3 stores whole, padded prefill-head shards in rank order. Each
@@ -708,8 +718,12 @@ def _pooled_kda_core(
 
     # Scatter the real slots back; the padding rows/elems of each region are
     # zero-filled so the pool bytes stay deterministic.
-    ssm_region_rows = layout.ssm_tokens * tok_bytes // (4 * head_dim)
-    new_ssm = new_ssm_buf[1:].reshape(num_reqs, ssm_rows, head_dim)
+    ssm_region_rows = layout.ssm_tokens * tok_bytes // (ssm_elem_bytes * head_dim)
+    new_ssm = (
+        new_ssm_buf[1:]
+        .astype(ssm_dtype)
+        .reshape(num_reqs, ssm_rows, head_dim)
+    )
     new_ssm = jnp.pad(new_ssm, ((0, 0), (0, ssm_region_rows - ssm_rows), (0, 0)))
     pool = pool_adapters.scatter_region(
         pool, new_ssm, state_indices, tok0=0, ntok=layout.ssm_tokens, split=split
@@ -762,6 +776,21 @@ def build_kimi_pooled_kda_op(
     pre-adjustment one (16) and the op would size its regions against the
     wrong manager block.
     """
+
+    from vllm.model_executor.layers.mamba.mamba_utils import MambaStateDtypeCalculator
+
+    model_cfg = getattr(vllm_config, "model_config", None)
+    cache_cfg = getattr(vllm_config, "cache_config", None)
+    _, ssm_dtype_obj = pooled_gdn_state_dtypes(
+        MambaStateDtypeCalculator.kda_state_dtype(
+            getattr(model_cfg, "dtype", torch.bfloat16),
+            getattr(cache_cfg, "mamba_cache_dtype", "auto"),
+            getattr(cache_cfg, "mamba_ssm_cache_dtype", "auto"),
+        )
+    )
+    ssm_state_dtype = str(ssm_dtype_obj)
+    if not ssm_state_dtype.startswith("torch."):
+        ssm_state_dtype = f"torch.{ssm_state_dtype}"
 
     conv_shard_heads = None
     if (
@@ -818,6 +847,7 @@ def build_kimi_pooled_kda_op(
             pool_block_tokens=vllm_config.cache_config.block_size,
             conv_shard_heads=conv_shard_heads,
             num_spec_tokens=num_spec_tokens,
+            ssm_state_dtype=ssm_state_dtype,
         )
 
     # vLLM's compile cache is keyed on the model config and not on the op
@@ -826,6 +856,8 @@ def build_kimi_pooled_kda_op(
     # era would otherwise be served stale.
     op_name = f"pallas::kimi_pooled_kda_fused_{prefix.replace('.', '_')}"
     op_name += f"_conv_{DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.removeprefix('torch.')}"
+    if ssm_state_dtype != DEFAULT_POOLED_GDN_SSM_STATE_DTYPE:
+        op_name += f"_ssm_{ssm_state_dtype.removeprefix('torch.')}"
     if num_spec_tokens:
         op_name += f"_window{num_spec_tokens + 1}"
     if conv_shard_heads is not None:

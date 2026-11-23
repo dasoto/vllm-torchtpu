@@ -325,3 +325,66 @@ def test_ep_weight_filter_is_realigned_to_chip_block(monkeypatch) -> None:
     )
     moe_hierarchical.align_ep_weight_filter()
     assert default_loader.compute_local_expert_ids(224, 8, 0) == chip
+
+
+def test_tpu_moe_etp_size_splits_ep_group_across_dp_and_tp(monkeypatch) -> None:
+    """TPU_MOE_ETP_SIZE=2 on TP=32, DP=4 (128 single-core v6e chips) produces
+    EP=64 x ETP=2, loading 14 of 896 experts per 2-chip pair."""
+    from types import SimpleNamespace
+
+    import vllm.distributed as vllm_dist
+    from vllm.model_executor.model_loader import default_loader, ep_weight_filter
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter import moe_hierarchical
+
+    pristine = ep_weight_filter.compute_local_expert_ids
+    monkeypatch.setattr(envs, "TPU_MOE_ETP_SIZE", 2)
+    monkeypatch.setattr(vllm_dist, "get_tensor_model_parallel_world_size", lambda: 32)
+
+    seen_pairs: set[tuple[int, int]] = set()
+    union_expert_slices: set[tuple[int, int]] = set()
+    for global_rank in range(128):
+        monkeypatch.setattr(
+            vllm_dist,
+            "get_ep_group",
+            lambda r=global_rank: SimpleNamespace(world_size=128, rank_in_group=r),
+        )
+        split = moe_hierarchical.hierarchical_split_or_none()
+        assert split is not None
+        ep_size, ep_rank, tp_size, tp_rank = split
+        assert (ep_size, tp_size) == (64, 2)
+        assert ep_rank == global_rank // 2
+        assert tp_rank == global_rank % 2
+        assert (ep_rank, tp_rank) not in seen_pairs
+        seen_pairs.add((ep_rank, tp_rank))
+
+        monkeypatch.setattr(moe_hierarchical, "_filter_patched", False)
+        monkeypatch.setattr(default_loader, "compute_local_expert_ids", pristine)
+        moe_hierarchical.align_ep_weight_filter()
+        owned = default_loader.compute_local_expert_ids(896, 128, global_rank)
+        assert owned == set(range(ep_rank * 14, (ep_rank + 1) * 14))
+        for e in owned:
+            union_expert_slices.add((e, tp_rank))
+
+    assert len(seen_pairs) == 128
+    assert len(union_expert_slices) == 896 * 2
+
+
+def test_tpu_moe_etp_size_rejects_non_divisor(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import vllm.distributed as vllm_dist
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter import moe_hierarchical
+
+    monkeypatch.setattr(envs, "TPU_MOE_ETP_SIZE", 3)
+    monkeypatch.setattr(envs, "TPU_MOE_HIERARCHICAL_EP", False)
+    monkeypatch.setattr(vllm_dist, "get_tensor_model_parallel_world_size", lambda: 32)
+    monkeypatch.setattr(
+        vllm_dist,
+        "get_ep_group",
+        lambda: SimpleNamespace(world_size=128, rank_in_group=0),
+    )
+    assert moe_hierarchical.hierarchical_split_or_none() is None
