@@ -75,6 +75,7 @@ from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
@@ -158,6 +159,7 @@ class KimiDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         block_residuals: torch.Tensor | None,
         sequence_parallel: bool = False,
+        padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if self.attn_res_block_size is None:
             residual = hidden_states
@@ -170,7 +172,9 @@ class KimiDecoderLayer(nn.Module):
             hidden_states = self.post_attention_layernorm(hidden_states)
             if self.is_moe:
                 hidden_states = self.block_sparse_moe(
-                    hidden_states, sequence_parallel=sequence_parallel
+                    hidden_states,
+                    sequence_parallel=sequence_parallel,
+                    padding_mask=padding_mask,
                 )
             else:
                 hidden_states = self.mlp(
@@ -197,7 +201,9 @@ class KimiDecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         if self.is_moe:
             hidden_states = self.block_sparse_moe(
-                hidden_states, sequence_parallel=sequence_parallel
+                hidden_states,
+                sequence_parallel=sequence_parallel,
+                padding_mask=padding_mask,
             )
         else:
             hidden_states = self.mlp(hidden_states, sequence_parallel=sequence_parallel)
@@ -316,6 +322,15 @@ class KimiModel(nn.Module):
             and num_tokens >= sp_min_tokens
             and num_tokens % self.sp_group.world_size == 0
         )
+        padding_mask: torch.Tensor | None = None
+        if generic_sp and token_padding._padding_state is not None:
+            padding_mask = token_padding._padding_state.get_local_padding_mask(
+                num_tokens
+            )
+            if sequence_parallel:
+                padding_mask = padding_mask.reshape(self.sp_group.world_size, -1)[
+                    self.sp_group.rank_in_group
+                ].contiguous()
         if sequence_parallel:
             hidden_states = hidden_states.reshape(
                 self.sp_group.world_size, -1, hidden_states.shape[-1]
@@ -334,12 +349,21 @@ class KimiModel(nn.Module):
             aux_hidden_states.append(hidden_states)
 
         for layer_idx, layer in enumerate(self.layers):
-            hidden_states, block_residuals = layer(
-                positions,
-                hidden_states,
-                block_residuals,
-                sequence_parallel=sequence_parallel,
-            )
+            if padding_mask is not None:
+                hidden_states, block_residuals = layer(
+                    positions,
+                    hidden_states,
+                    block_residuals,
+                    sequence_parallel=sequence_parallel,
+                    padding_mask=padding_mask,
+                )
+            else:
+                hidden_states, block_residuals = layer(
+                    positions,
+                    hidden_states,
+                    block_residuals,
+                    sequence_parallel=sequence_parallel,
+                )
             if layer_idx + 1 in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states)
 

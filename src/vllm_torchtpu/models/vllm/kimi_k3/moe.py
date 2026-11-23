@@ -341,10 +341,15 @@ class KimiMoE(nn.Module):
             )
 
     def forward(
-        self, hidden_states: torch.Tensor, sequence_parallel: bool = False
+        self,
+        hidden_states: torch.Tensor,
+        sequence_parallel: bool = False,
+        padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if sequence_parallel or getattr(self, "prefill_group", None) is not None:
-            return self._forward_expert_parallel(hidden_states, sequence_parallel)
+            return self._forward_expert_parallel(
+                hidden_states, sequence_parallel, padding_mask=padding_mask
+            )
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
         router_logits, _ = self.gate(hidden_states)
@@ -366,7 +371,10 @@ class KimiMoE(nn.Module):
         return output.view(num_tokens, hidden_size)
 
     def _forward_expert_parallel(
-        self, hidden_states: torch.Tensor, sequence_parallel: bool
+        self,
+        hidden_states: torch.Tensor,
+        sequence_parallel: bool,
+        padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run EP experts with sharded or replicated tokens, then add shared experts."""
         group = self.prefill_group
@@ -386,6 +394,10 @@ class KimiMoE(nn.Module):
                 router_logits,
                 topk_weights_float32=method._tpu_topk_weights_float32,
             )
+            if padding_mask is not None:
+                weights = torch.where(
+                    padding_mask[:, None], torch.zeros_like(weights), weights
+                )
             latent, weights, ids = group.gather_moe_inputs(
                 latent,
                 weights,
@@ -394,7 +406,12 @@ class KimiMoE(nn.Module):
                 sequence_parallel=sequence_parallel,
             )
             output = method.apply_with_routing(
-                routed, latent, weights, ids, pipelined=False
+                routed,
+                latent,
+                weights,
+                ids,
+                pipelined=False,
+                padding_already_zeroed=padding_mask is not None,
             )
             output = group.reduce_moe_output(output, sequence_parallel=sequence_parallel)
         else:

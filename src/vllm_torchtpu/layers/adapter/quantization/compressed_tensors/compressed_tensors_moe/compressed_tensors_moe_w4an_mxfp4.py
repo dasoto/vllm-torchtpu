@@ -334,6 +334,7 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         topk_ids: torch.Tensor,
         *,
         pipelined: bool = False,
+        padding_already_zeroed: bool = False,
     ) -> torch.Tensor:
         """Run experts from preselected routes, including padding masking.
 
@@ -351,9 +352,10 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             torch.float32 if self._tpu_topk_weights_float32 else x.dtype
         )
 
-        topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
-            topk_ids, topk_weights, is_local_tensor=pipelined
-        )
+        if not padding_already_zeroed:
+            topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
+                topk_ids, topk_weights, is_local_tensor=pipelined
+            )
 
         kwargs = {
             "topk_weights_float32": self._tpu_topk_weights_float32,

@@ -51,18 +51,19 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
             return input_
         if dim < 0:
             dim += input_.dim()
-        input_size = input_.size()
         out = funcol.all_gather_single(input_.contiguous(), 0, self.device_group)
         if isinstance(out, funcol.AsyncCollectiveTensor):
             out = out.wait()
         if dim == 0:
             return out
-        out = out.reshape((self.world_size,) + input_size)
+        static_tail = tuple(int(s) for s in input_.shape[1:])
+        out = out.reshape((self.world_size, -1) + static_tail)
         out = out.movedim(0, dim)
         return out.reshape(
-            input_size[:dim]
-            + (self.world_size * input_size[dim],)
-            + input_size[dim + 1 :]
+            (-1,)
+            + static_tail[: dim - 1]
+            + (self.world_size * static_tail[dim - 1],)
+            + static_tail[dim:]
         )
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
