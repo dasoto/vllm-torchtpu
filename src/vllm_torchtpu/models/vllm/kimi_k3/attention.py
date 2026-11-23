@@ -63,7 +63,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import fresh_buffer
 
-from .collective_ops import FusedPrefillCollectives
+from .collective_ops import FusedPrefillCollectives, GenericSPCollectives
 from .indexer import KimiDSAConfig, KimiDSAIndexer
 
 logger = init_logger(__name__)
@@ -347,7 +347,9 @@ class MultiHeadLatentAttention(nn.Module):
             )
 
         self.prefill_group = (
-            FusedPrefillCollectives(prefix) if envs.TPU_K3_SP_PREFILL else None
+            FusedPrefillCollectives(prefix)
+            if envs.TPU_K3_SP_PREFILL
+            else (GenericSPCollectives() if envs.TPU_K3_GENERIC_SP else None)
         )
         indexer = None
         if dsa is not None:
@@ -587,7 +589,9 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             reduce_results=False,
         )
         self.prefill_group = (
-            FusedPrefillCollectives(prefix) if envs.TPU_K3_SP_PREFILL else None
+            FusedPrefillCollectives(prefix)
+            if envs.TPU_K3_SP_PREFILL
+            else (GenericSPCollectives() if envs.TPU_K3_GENERIC_SP else None)
         )
         self.register_buffer("packed_prefill_weight", None, persistent=False)
         self.kv_cache = None

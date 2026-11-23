@@ -3017,3 +3017,201 @@ def test_kimi_moe_fuses_tp_row_parallel_up_proj_and_shared_all_reduce(
     summed = torch.stack(partials, dim=0).sum(dim=0)
     expected = routed_out @ full_up_w.t() + (1.25 * tp_size)
     torch.testing.assert_close(summed, expected, atol=5e-2, rtol=2e-2)
+
+
+def test_generic_sp_collectives_dp_and_ep_moe_equivalence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify GenericSPCollectives produces identical MoE results across
+    sequence_parallel=True (EP gather + EP reduce-scatter) and
+    sequence_parallel=False (DP gather + DP reduce-scatter + TP all-reduce)
+    on a DP=2 x TP=4 = EP=8 grid."""
+    from vllm.distributed import parallel_state
+
+    from vllm_torchtpu.models.vllm.kimi_k3 import collective_ops
+
+    dp_size, tp_size = 2, 4
+    ep_size = dp_size * tp_size
+    seq_len, hidden = 8, 6
+    s_sp = seq_len // tp_size
+    torch.manual_seed(42)
+    dp_inputs = [torch.randn(seq_len, hidden) for _ in range(dp_size)]
+    dp_weights = [torch.rand(seq_len, 2) for _ in range(dp_size)]
+    dp_ids = [torch.randint(0, 16, (seq_len, 2), dtype=torch.int32) for _ in range(dp_size)]
+    shard_transforms = [torch.randn(hidden, hidden) * 0.25 for _ in range(ep_size)]
+
+    monkeypatch.setattr(envs, "TPU_MOE_FP8_ALL_GATHER", False)
+
+    # 1. sequence_parallel=True: each rank (d, t) holds slice t of DP[d].
+    sp_latents = {}
+    sp_w = {}
+    sp_i = {}
+    for d in range(dp_size):
+        for t in range(tp_size):
+            r = d * tp_size + t
+            sp_latents[r] = dp_inputs[d][t * s_sp : (t + 1) * s_sp]
+            sp_w[r] = dp_weights[d][t * s_sp : (t + 1) * s_sp]
+            sp_i[r] = dp_ids[d][t * s_sp : (t + 1) * s_sp]
+
+    ep_ag_latent = torch.cat([sp_latents[r] for r in range(ep_size)], dim=0)
+    ep_ag_w = torch.cat([sp_w[r] for r in range(ep_size)], dim=0)
+    ep_ag_i = torch.cat([sp_i[r] for r in range(ep_size)], dim=0)
+    sp_partials = []
+    for r in range(ep_size):
+        tp_grp = SimpleNamespace(
+            world_size=tp_size,
+            rank_in_group=r % tp_size,
+            all_gather=lambda x, dim=0: x,
+            reduce_scatter=lambda x, dim=0: x,
+            all_reduce=lambda x: x,
+        )
+        ep_grp = SimpleNamespace(
+            world_size=ep_size,
+            rank_in_group=r,
+            all_gather=lambda x, dim=0, _x=(ep_ag_latent, ep_ag_w, ep_ag_i): (
+                _x[0]
+                if x.shape == (s_sp, hidden)
+                else (_x[1] if x.dtype.is_floating_point else _x[2])
+            ),
+            reduce_scatter=lambda y, dim=0: y,
+        )
+        monkeypatch.setattr(collective_ops, "get_ep_group", lambda _g=ep_grp: _g)
+        coll = collective_ops.GenericSPCollectives(tp_grp)
+        ag_lat, ag_w, ag_ids = coll.gather_moe_inputs(
+            sp_latents[r], sp_w[r], sp_i[r], num_experts=16, sequence_parallel=True
+        )
+        sp_partials.append((ag_lat * ag_w[:, :1]) @ shard_transforms[r])
+    ep_sum = torch.stack(sp_partials, dim=0).sum(dim=0)
+
+    sp_outputs = {}
+    for r in range(ep_size):
+        tp_grp = SimpleNamespace(
+            world_size=tp_size,
+            rank_in_group=r % tp_size,
+            all_reduce=lambda x: x,
+        )
+        ep_grp = SimpleNamespace(
+            world_size=ep_size,
+            rank_in_group=r,
+            reduce_scatter=lambda _y, dim=0, _r=r: ep_sum[_r * s_sp : (_r + 1) * s_sp],
+        )
+        monkeypatch.setattr(collective_ops, "get_ep_group", lambda _g=ep_grp: _g)
+        coll = collective_ops.GenericSPCollectives(tp_grp)
+        sp_outputs[r] = coll.reduce_moe_output(
+            sp_partials[r], sequence_parallel=True
+        )
+
+    # 2. sequence_parallel=False: each rank (d, t) holds all seq_len tokens of DP[d].
+    dp_ag_latent = torch.cat(dp_inputs, dim=0)
+    dp_ag_w = torch.cat(dp_weights, dim=0)
+    dp_ag_i = torch.cat(dp_ids, dim=0)
+    non_sp_partials = {}
+    for d in range(dp_size):
+        for t in range(tp_size):
+            r = d * tp_size + t
+            tp_grp = SimpleNamespace(world_size=tp_size, rank_in_group=t)
+            dp_grp = SimpleNamespace(
+                world_size=dp_size,
+                rank_in_group=d,
+                all_gather=lambda x, dim=0: (
+                    dp_ag_latent
+                    if x.shape == (seq_len, hidden)
+                    else (dp_ag_w if x.dtype.is_floating_point else dp_ag_i)
+                ),
+            )
+            monkeypatch.setattr(parallel_state, "get_dp_group", lambda _g=dp_grp: _g)
+            coll = collective_ops.GenericSPCollectives(tp_grp)
+            ag_lat, ag_w, _ = coll.gather_moe_inputs(
+                dp_inputs[d],
+                dp_weights[d],
+                dp_ids[d],
+                num_experts=16,
+                sequence_parallel=False,
+            )
+            non_sp_partials[(d, t)] = (ag_lat * ag_w[:, :1]) @ shard_transforms[r]
+
+    for d in range(dp_size):
+        tp_reduced_slices = []
+        for t in range(tp_size):
+            dp_sum_t = sum(non_sp_partials[(d_src, t)] for d_src in range(dp_size))
+            dp_rs_d_t = dp_sum_t[d * seq_len : (d + 1) * seq_len]
+            tp_reduced_slices.append(dp_rs_d_t)
+        tp_sum_d = torch.stack(tp_reduced_slices, dim=0).sum(dim=0)
+        for t in range(tp_size):
+            r = d * tp_size + t
+            tp_grp = SimpleNamespace(
+                world_size=tp_size,
+                rank_in_group=t,
+                all_reduce=lambda _x, _s=tp_sum_d: _s,
+            )
+            dp_grp = SimpleNamespace(
+                world_size=dp_size,
+                rank_in_group=d,
+                reduce_scatter=lambda _y, dim=0, _s=tp_reduced_slices[t]: _s,
+            )
+            monkeypatch.setattr(parallel_state, "get_dp_group", lambda _g=dp_grp: _g)
+            coll = collective_ops.GenericSPCollectives(tp_grp)
+            full_out = coll.reduce_moe_output(
+                non_sp_partials[(d, t)], sequence_parallel=False
+            )
+            torch.testing.assert_close(
+                sp_outputs[r],
+                full_out[t * s_sp : (t + 1) * s_sp],
+                atol=1e-5,
+                rtol=1e-5,
+            )
+
+
+def test_kimi_model_generic_sp_min_tokens_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify KimiModel slices tokens >= TPU_K3_GENERIC_SP_MIN_TOKENS across
+    TP and keeps smaller decode buckets unsharded."""
+    from vllm_torchtpu.models.vllm.kimi_k3 import model as kimi_model
+
+    tp_size = 4
+    tp_rank = 2
+    seen_sp_flags: list[tuple[int, bool]] = []
+
+    fake_tp = SimpleNamespace(
+        world_size=tp_size,
+        rank_in_group=tp_rank,
+        all_gather=lambda x, dim=0: x.repeat(tp_size, 1),
+        reduce_scatter=lambda x, dim=0: x[: x.shape[0] // tp_size],
+        all_reduce=lambda x: x,
+    )
+    monkeypatch.setattr(envs, "TPU_K3_SP_PREFILL", False)
+    monkeypatch.setattr(envs, "TPU_K3_GENERIC_SP", True)
+    monkeypatch.setattr(envs, "TPU_K3_GENERIC_SP_MIN_TOKENS", 512)
+
+    m = kimi_model.KimiModel.__new__(kimi_model.KimiModel)
+    nn.Module.__init__(m)
+    m.attn_res_block_size = None
+    m.sp_prefill = False
+    m.generic_sp = True
+    m.sp_min_tokens = 512
+    m.sp_group = kimi_model.GenericSPCollectives(fake_tp)
+    m.aux_hidden_state_layers = ()
+    m.embed_tokens = lambda ids: torch.ones(ids.shape[0], 8)
+    m.norm = nn.Identity()
+
+    class DummyLayer(nn.Module):
+        def forward(self, positions, hidden_states, block_residuals, sequence_parallel=False):
+            seen_sp_flags.append((hidden_states.shape[0], sequence_parallel))
+            return hidden_states, block_residuals
+
+    m.layers = nn.ModuleList([DummyLayer()])
+
+    # Decode bucket (128 < 512): stays unsharded (128 rows, sequence_parallel=False)
+    out_decode = kimi_model.KimiModel.forward(
+        m, torch.zeros(128, dtype=torch.long), torch.arange(128)
+    )
+    assert out_decode.shape == (128, 8)
+    assert seen_sp_flags[-1] == (128, False)
+
+    # Prefill bucket (2048 >= 512): sharded to 2048 // 4 = 512 rows, then gathered back
+    out_prefill = kimi_model.KimiModel.forward(
+        m, torch.zeros(2048, dtype=torch.long), torch.arange(2048)
+    )
+    assert out_prefill.shape == (2048, 8)
+    assert seen_sp_flags[-1] == (512, True)

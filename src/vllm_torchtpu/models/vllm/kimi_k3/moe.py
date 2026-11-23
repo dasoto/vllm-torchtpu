@@ -35,7 +35,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.distributed.intra_chip import get_intra_chip_group
+from vllm_torchtpu.distributed.intra_chip import get_intra_chip_group, get_tp_subgroup
 from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import make_latent_projection
 from vllm_torchtpu.layers.adapter.moe_hierarchical import (
@@ -44,7 +44,7 @@ from vllm_torchtpu.layers.adapter.moe_hierarchical import (
 )
 from vllm_torchtpu.layers.adapter.quantization.unquantized import VllmUnquantizedConfig
 
-from .collective_ops import FusedPrefillCollectives
+from .collective_ops import FusedPrefillCollectives, GenericSPCollectives
 from .layers import KimiMLP
 
 if TYPE_CHECKING:
@@ -120,8 +120,15 @@ class KimiMoE(nn.Module):
         # QUANTIZE_ON_LOAD_PREFIXES. When TP > 1 (non-SP), shard
         # routed_expert_up_proj row-parallel across TP with reduce_results=False
         # and fuse its reduction with shared_experts in one TP all-reduce.
+        self.generic_sp = (
+            not envs.TPU_K3_SP_PREFILL
+            and envs.TPU_K3_GENERIC_SP
+            and self.tp_size > 1
+            and self.use_ep
+        )
         self._fuse_tp_up_proj = (
             not envs.TPU_K3_SP_PREFILL
+            and not self.generic_sp
             and routed_expert_hidden_size is not None
             and self.tp_size > 1
             and expert_hidden_size % self.tp_size == 0
@@ -194,6 +201,23 @@ class KimiMoE(nn.Module):
             self.shared_group = get_intra_chip_group()
             if self.shared_group is None or self.shared_group.world_size != 2:
                 raise ValueError("K3 SP prefill needs a physical two-core chip group")
+        elif self.generic_sp:
+            from vllm.distributed import get_tp_group
+
+            self.prefill_group = GenericSPCollectives()
+            shared_interm = config.moe_intermediate_size * config.num_shared_experts
+            sub_sz = envs.TPU_K3_GENERIC_SP_SHARED_SUBGROUP
+            subgroup = (
+                get_tp_subgroup(sub_sz)
+                if (
+                    sub_sz >= 2
+                    and sub_sz < self.tp_size
+                    and shared_interm > 0
+                    and shared_interm % sub_sz == 0
+                )
+                else None
+            )
+            self.shared_group = subgroup if subgroup is not None else get_tp_group()
 
         self.shared_experts = (
             KimiMLP(
@@ -319,7 +343,7 @@ class KimiMoE(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, sequence_parallel: bool = False
     ) -> torch.Tensor:
-        if sequence_parallel or self.shared_group is not None:
+        if sequence_parallel or getattr(self, "prefill_group", None) is not None:
             return self._forward_expert_parallel(hidden_states, sequence_parallel)
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
@@ -352,7 +376,7 @@ class KimiMoE(nn.Module):
         if self.routed_expert_down_proj is not None:
             latent, _ = self.routed_expert_down_proj(latent)
         routed = self.experts.routed_experts
-        if sequence_parallel:
+        if isinstance(group, GenericSPCollectives):
             method = cast(
                 "VllmCompressedTensorsW4ANMxfp4MoEMethod", routed.quant_method
             )
@@ -363,16 +387,40 @@ class KimiMoE(nn.Module):
                 topk_weights_float32=method._tpu_topk_weights_float32,
             )
             latent, weights, ids = group.gather_moe_inputs(
-                latent, weights, ids, num_experts=self.gate.output_size
+                latent,
+                weights,
+                ids,
+                num_experts=self.gate.output_size,
+                sequence_parallel=sequence_parallel,
             )
-            output = method.apply_with_routing(routed, latent, weights, ids)
+            output = method.apply_with_routing(
+                routed, latent, weights, ids, pipelined=False
+            )
+            output = group.reduce_moe_output(output, sequence_parallel=sequence_parallel)
         else:
-            output = routed.quant_method.apply_monolithic(routed, latent, router_logits)
-        output = (
-            group.reduce_scatter(output, dim=0)
-            if sequence_parallel
-            else group.all_reduce(output)
-        )
+            if sequence_parallel:
+                method = cast(
+                    "VllmCompressedTensorsW4ANMxfp4MoEMethod", routed.quant_method
+                )
+                weights, ids = moe_routing.route(
+                    routed,
+                    latent,
+                    router_logits,
+                    topk_weights_float32=method._tpu_topk_weights_float32,
+                )
+                latent, weights, ids = group.gather_moe_inputs(
+                    latent, weights, ids, num_experts=self.gate.output_size
+                )
+                output = method.apply_with_routing(routed, latent, weights, ids)
+            else:
+                output = routed.quant_method.apply_monolithic(
+                    routed, latent, router_logits
+                )
+            output = (
+                group.reduce_scatter(output, dim=0)
+                if sequence_parallel
+                else group.all_reduce(output)
+            )
         if self.routed_expert_norm is not None:
             output = self.routed_expert_norm(output)
         if self.routed_expert_up_proj is not None:

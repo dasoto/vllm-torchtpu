@@ -79,7 +79,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 from .attention import KimiDeltaAttention, MultiHeadLatentAttention, kda_state_dtype
-from .collective_ops import TokenShardCollectives
+from .collective_ops import GenericSPCollectives, TokenShardCollectives
 from .indexer import KimiDSAConfig, kimi_dsa_config
 from .kimi_vit import KimiK3MoonViT3dPretrainedModel
 from .layers import AttentionResidual, KimiMLP
@@ -226,9 +226,20 @@ class KimiModel(nn.Module):
             config.attn_res_block_size,
         )
         self.attn_res_block_size = config.attn_res_block_size
+        parallel = getattr(vllm_config, "parallel_config", None)
         self.sp_prefill = envs.TPU_K3_SP_PREFILL
+        self.generic_sp = (
+            not self.sp_prefill
+            and envs.TPU_K3_GENERIC_SP
+            and parallel is not None
+            and parallel.tensor_parallel_size > 1
+            and parallel.pipeline_parallel_size == 1
+        )
+        self.sp_min_tokens = (
+            max(1, envs.TPU_K3_GENERIC_SP_MIN_TOKENS) if self.generic_sp else 1
+        )
         if self.sp_prefill:
-            parallel = vllm_config.parallel_config
+            assert parallel is not None
             if (
                 parallel.tensor_parallel_size != 32
                 or not parallel.enable_expert_parallel
@@ -237,6 +248,16 @@ class KimiModel(nn.Module):
             ):
                 raise ValueError("K3 SP prefill requires TP32/EP32 and PP1/DP1")
             self.sp_group = TokenShardCollectives(get_tp_group())
+        elif self.generic_sp:
+            self.sp_group = GenericSPCollectives(get_tp_group())
+            logger.info(
+                "Enabled generic Kimi K3 SP prefill: tp_size=%d, dp_size=%d, "
+                "min_tokens=%d, shared_subgroup=%d",
+                parallel.tensor_parallel_size,
+                parallel.data_parallel_size,
+                self.sp_min_tokens,
+                envs.TPU_K3_GENERIC_SP_SHARED_SUBGROUP,
+            )
 
         dsa = kimi_dsa_config(config)
         self.topk_indices_buffer = None
@@ -288,9 +309,11 @@ class KimiModel(nn.Module):
             assert input_ids is not None
             hidden_states = self.embed_input_ids(input_ids)
         num_tokens = hidden_states.shape[0]
+        generic_sp = getattr(self, "generic_sp", False)
+        sp_min_tokens = getattr(self, "sp_min_tokens", 1) if generic_sp else 1
         sequence_parallel = (
-            self.sp_prefill
-            and num_tokens > 0
+            (self.sp_prefill or generic_sp)
+            and num_tokens >= sp_min_tokens
             and num_tokens % self.sp_group.world_size == 0
         )
         if sequence_parallel:

@@ -387,3 +387,83 @@ class FusedPrefillCollectives:
 
     def all_reduce(self, x):
         return self.base.all_reduce(x)
+
+
+class GenericSPCollectives:
+    """Process-group SP collectives for multi-host / DP>=1 Kimi K3 deployments."""
+
+    def __init__(self, tp_group=None) -> None:
+        self.base = tp_group if tp_group is not None else get_tp_group()
+        self.world_size = int(self.base.world_size)
+        self.rank_in_group = int(self.base.rank_in_group)
+
+    def all_gather(self, x: torch.Tensor, dim: int = 0) -> torch.Tensor:
+        if self.world_size <= 1:
+            return x
+        return self.base.all_gather(x, dim=dim)
+
+    def reduce_scatter(self, x: torch.Tensor, dim: int = 0) -> torch.Tensor:
+        if self.world_size <= 1:
+            return x
+        return self.base.reduce_scatter(x, dim=dim)
+
+    def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        if self.world_size <= 1:
+            return x
+        return self.base.all_reduce(x)
+
+    def _moe_gather_group(self, *, sequence_parallel: bool):
+        if sequence_parallel:
+            ep = get_ep_group()
+            return ep if ep is not None else self.base
+        from vllm.distributed.parallel_state import get_dp_group
+
+        try:
+            return get_dp_group()
+        except (AssertionError, AttributeError, RuntimeError):
+            return None
+
+    def gather_moe_inputs(
+        self,
+        latent: torch.Tensor,
+        weights: torch.Tensor,
+        ids: torch.Tensor,
+        *,
+        num_experts: int,
+        sequence_parallel: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        del num_experts
+        from vllm_torchtpu import envs
+        from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
+            _quantized_all_gather_with_routing,
+        )
+
+        ids = ids.to(torch.int32)
+        group = self._moe_gather_group(sequence_parallel=sequence_parallel)
+        if group is None or int(group.world_size) <= 1:
+            return latent, weights, ids
+        if envs.TPU_MOE_FP8_ALL_GATHER:
+            ag_latent, ag_weights, ag_ids = _quantized_all_gather_with_routing(
+                group, latent, weights, ids
+            )
+            assert ag_weights is not None and ag_ids is not None
+            return ag_latent, ag_weights, ag_ids
+        return (
+            group.all_gather(latent, dim=0),
+            group.all_gather(weights, dim=0),
+            group.all_gather(ids, dim=0),
+        )
+
+    def reduce_moe_output(
+        self, output: torch.Tensor, *, sequence_parallel: bool = True
+    ) -> torch.Tensor:
+        if sequence_parallel:
+            ep = get_ep_group()
+            group = ep if ep is not None else self.base
+            if int(group.world_size) <= 1:
+                return output
+            return group.reduce_scatter(output, dim=0)
+        dp_group = self._moe_gather_group(sequence_parallel=False)
+        if dp_group is not None and int(dp_group.world_size) > 1:
+            output = dp_group.reduce_scatter(output, dim=0)
+        return self.all_reduce(output)
