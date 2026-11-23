@@ -3215,3 +3215,41 @@ def test_kimi_model_generic_sp_min_tokens_threshold(
     )
     assert out_prefill.shape == (2048, 8)
     assert seen_sp_flags[-1] == (512, True)
+
+
+def test_tpu_device_communicator_functional_all_gather_and_reduce_scatter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify TpuDeviceCommunicator.all_gather and reduce_scatter delegate to
+    functional collectives (without torch.empty) for both dim=0 and dim=-1."""
+    from vllm_torchtpu.distributed import tpu_communicator
+
+    comm = tpu_communicator.TpuDeviceCommunicator.__new__(
+        tpu_communicator.TpuDeviceCommunicator
+    )
+    comm.world_size = 4
+    comm.device_group = object()
+
+    ranks_x = [torch.arange(12, dtype=torch.float32).view(3, 4) + 100 * r for r in range(4)]
+    monkeypatch.setattr(
+        tpu_communicator.funcol,
+        "all_gather_single",
+        lambda x, gather_dim, group: torch.cat(ranks_x, dim=0),
+    )
+    monkeypatch.setattr(
+        tpu_communicator.funcol,
+        "reduce_scatter_single",
+        lambda x, op, scatter_dim, group: x.view(4, -1, *x.shape[1:]).sum(dim=0),
+    )
+
+    ag0 = comm.all_gather(ranks_x[0], dim=0)
+    torch.testing.assert_close(ag0, torch.cat(ranks_x, dim=0))
+
+    ag_last = comm.all_gather(ranks_x[0], dim=-1)
+    torch.testing.assert_close(ag_last, torch.cat(ranks_x, dim=-1))
+
+    rs0 = comm.reduce_scatter(torch.cat(ranks_x, dim=0), dim=0)
+    torch.testing.assert_close(rs0, sum(ranks_x))
+
+    rs_last = comm.reduce_scatter(torch.cat(ranks_x, dim=-1), dim=-1)
+    torch.testing.assert_close(rs_last, sum(ranks_x))

@@ -21,6 +21,7 @@ rank.
 """
 
 import torch
+import torch.distributed._functional_collectives as funcol
 from vllm.distributed.device_communicators.base_device_communicator import (
     All2AllManagerBase,
     DeviceCommunicatorBase,
@@ -43,6 +44,40 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         # (support_fault_tolerance=False); it is never used for compute.
         if self.use_all2all:
             self.all2all_manager = TpuNullAll2AllManager(self.cpu_group)
+
+    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        """Functional all-gather avoiding concrete ``torch.empty(SymInt)`` on TPU."""
+        if self.world_size == 1 or self.device_group is None:
+            return input_
+        if dim < 0:
+            dim += input_.dim()
+        input_size = input_.size()
+        out = funcol.all_gather_single(input_.contiguous(), 0, self.device_group)
+        if isinstance(out, funcol.AsyncCollectiveTensor):
+            out = out.wait()
+        if dim == 0:
+            return out
+        out = out.reshape((self.world_size,) + input_size)
+        out = out.movedim(0, dim)
+        return out.reshape(
+            input_size[:dim]
+            + (self.world_size * input_size[dim],)
+            + input_size[dim + 1 :]
+        )
+
+    def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        """Functional reduce-scatter avoiding concrete ``torch.empty(SymInt)`` on TPU."""
+        if self.world_size == 1 or self.device_group is None:
+            return input_
+        if dim < 0:
+            dim += input_.dim()
+        input_tensor = input_.movedim(0, dim).contiguous()
+        out = funcol.reduce_scatter_single(
+            input_tensor, "sum", 0, self.device_group
+        )
+        if isinstance(out, funcol.AsyncCollectiveTensor):
+            out = out.wait()
+        return out.movedim(0, dim).contiguous()
 
     def _moe_group(self, is_sequence_parallel: bool):
         group = get_ep_group() if is_sequence_parallel else get_dp_group()
