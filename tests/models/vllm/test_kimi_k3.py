@@ -3339,12 +3339,9 @@ def test_cp_mla_merge_received_masks_nan_unowned_partials() -> None:
     torch.testing.assert_close(merged[1], torch.zeros(2, 4, dtype=torch.float32))
 
 
-def test_intra_chip_column_parallel_linear_all_to_all_and_pre_gathered(
-    monkeypatch,
-) -> None:
-    """Verify IntraChipColumnParallelLinear's all_to_all SP path and
-    pre_gathered_input bypass match full matmul output bit-for-bit."""
-    import vllm_torchtpu.layers.adapter.latent_proj_intra_chip as lpic
+def test_intra_chip_column_parallel_linear_pre_gathered_bypass() -> None:
+    """Verify IntraChipColumnParallelLinear's pre_gathered_input bypass skips
+    the redundant dim-0 all_gather and matches full matmul output bit-for-bit."""
     from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import (
         IntraChipColumnParallelLinear,
     )
@@ -3365,29 +3362,19 @@ def test_intra_chip_column_parallel_linear_all_to_all_and_pre_gathered(
 
     for r in range(world_size):
         w_r = full_w[:, r * col_per_rank : (r + 1) * col_per_rank]
-        ag_calls = [0]
+        ag_dim0_calls = [0]
 
         def fake_ag(t: torch.Tensor, dim: int = 0) -> torch.Tensor:
-            ag_calls[0] += 1
-            return full_x
+            if dim == 0:
+                ag_dim0_calls[0] += 1
+                return full_x
+            return torch.cat(all_outputs, dim=-1)
 
-        def fake_a2a(t: torch.Tensor, _group, _r=r) -> torch.Tensor:
-            # Block k of result came from rank k's _r-th token block.
-            return torch.cat(
-                [
-                    all_outputs[k][_r * tokens_per_rank : (_r + 1) * tokens_per_rank]
-                    for k in range(world_size)
-                ],
-                dim=0,
-            )
-
-        monkeypatch.setattr(lpic, "all_to_all", fake_a2a)
         proj = IntraChipColumnParallelLinear.__new__(IntraChipColumnParallelLinear)
         nn.Module.__init__(proj)
         proj._chip_group = SimpleNamespace(
             world_size=world_size,
             rank_in_group=r,
-            device_group=object(),
             all_gather=fake_ag,
         )
         proj.output_size = out_dim
@@ -3399,7 +3386,7 @@ def test_intra_chip_column_parallel_linear_all_to_all_and_pre_gathered(
 
         x_r = full_x[r * tokens_per_rank : (r + 1) * tokens_per_rank]
         out_r, _ = proj(x_r, sequence_parallel=True, pre_gathered_input=full_x)
-        assert ag_calls[0] == 0
+        assert ag_dim0_calls[0] == 0
         torch.testing.assert_close(
             out_r,
             expected_full[r * tokens_per_rank : (r + 1) * tokens_per_rank],

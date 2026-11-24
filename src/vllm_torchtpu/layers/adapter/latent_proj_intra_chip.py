@@ -39,7 +39,6 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLi
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.distributed.collectives import all_to_all
 from vllm_torchtpu.distributed.intra_chip import get_intra_chip_group, get_tp_subgroup
 from vllm_torchtpu.logger import init_logger
 
@@ -103,21 +102,10 @@ class IntraChipColumnParallelLinear(ColumnParallelLinear):
                 else self._chip_group.all_gather(input_, dim=0)
             )
             output_parallel = self.quant_method.apply(self, gathered_in, bias)
-            if getattr(self._chip_group, "device_group", None) is not None:
-                exchanged = all_to_all(output_parallel, self._chip_group)
-                out_per_part = int(output_parallel.shape[-1])
-                output = (
-                    exchanged.reshape(
-                        self._chip_group.world_size, -1, out_per_part
-                    )
-                    .movedim(0, 1)
-                    .reshape(-1, self.output_size)
-                )
-            else:
-                gathered_out = self._chip_group.all_gather(output_parallel, dim=-1)
-                output = gathered_out.reshape(
-                    self._chip_group.world_size, -1, self.output_size
-                )[self._chip_group.rank_in_group].contiguous()
+            gathered_out = self._chip_group.all_gather(output_parallel, dim=-1)
+            output = gathered_out.reshape(
+                self._chip_group.world_size, -1, self.output_size
+            )[self._chip_group.rank_in_group].contiguous()
         else:
             output_parallel = self.quant_method.apply(self, input_, bias)
             output = self._chip_group.all_gather(output_parallel, dim=-1)

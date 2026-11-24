@@ -37,7 +37,6 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.distributed.collectives import all_to_all
 from vllm_torchtpu.distributed.intra_chip import get_intra_chip_group, get_tp_subgroup
 from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import (
@@ -80,15 +79,10 @@ class KimiRoutedOutputTransform(nn.Module):
 def _subgroup_feature_to_token_a2a(
     x: torch.Tensor, group, part: int
 ) -> torch.Tensor:
-    """Redistribute ``[S_local, W * part]`` across ``group`` into ``[W * S_local, part]``."""
+    """Gather ``[S_local, W * part]`` across ``group`` and slice ``[W * S_local, part]``."""
     ws = int(group.world_size)
     if ws <= 1:
         return x
-    if getattr(group, "device_group", None) is not None:
-        return all_to_all(
-            x.unflatten(-1, (ws, part)).movedim(0, 1).reshape(-1, part),
-            group,
-        )
     rank = int(group.rank_in_group)
     return group.all_gather(x, dim=0).narrow(-1, rank * part, part).contiguous()
 
