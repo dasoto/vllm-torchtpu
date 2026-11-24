@@ -1115,7 +1115,7 @@ def patch_expert_placement_routers() -> None:
     base_loader.process_weights_after_loading = process_weights_after_loading
 
 
-def patch_object_storage_pull_files_lock() -> None:
+def patch_object_storage_pull_files_lock(runai_utils_mod=None) -> None:
     """Serialize and atomically stage ``ObjectStorageModel.pull_files`` across processes.
 
     With ``--api-server-count > 1``, multiple ``ApiServer`` and ``EngineCore``
@@ -1126,9 +1126,11 @@ def patch_object_storage_pull_files_lock() -> None:
     import fcntl
     import hashlib
     import tempfile
-    from vllm.transformers_utils import runai_utils
 
-    cls = getattr(runai_utils, "ObjectStorageModel", None)
+    if runai_utils_mod is None:
+        from vllm.transformers_utils import runai_utils as runai_utils_mod
+
+    cls = getattr(runai_utils_mod, "ObjectStorageModel", None)
     if cls is None or getattr(cls.pull_files, "_tpu_pull_files_lock_patch", False):
         return
 
@@ -1166,7 +1168,7 @@ def patch_object_storage_pull_files_lock() -> None:
                 with tempfile.TemporaryDirectory(
                     prefix=".stage_pull_", dir=parent_dir
                 ) as stage_dir:
-                    runai_utils.runai_pull_files(
+                    runai_utils_mod.runai_pull_files(
                         norm_path, stage_dir, allow_pattern, ignore_pattern
                     )
                     for root, _, files in os.walk(stage_dir):

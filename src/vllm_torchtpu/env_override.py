@@ -268,6 +268,75 @@ def _patch_jax_pallas_fori_lowering() -> None:
     _lowering._torchtpu_fori_patch_applied = True
 
 
+def _install_runai_pull_files_import_hook() -> None:
+    """Hook ``vllm.transformers_utils.runai_utils`` on first import without importing vllm early.
+
+    ``ModelConfig.maybe_pull_model_tokenizer_for_runai`` runs before
+    ``current_platform`` activation in spawned ``ApiServer`` workers when
+    ``--api-server-count > 1``, so ``_ENGINE`` patches are too late to prevent
+    concurrent ``runai_pull_files`` truncation races on config JSON files.
+    """
+    import importlib.abc
+    import sys
+
+    target_mod = "vllm.transformers_utils.runai_utils"
+
+    def _patch_module(mod) -> None:
+        from vllm_torchtpu.model_loader_patches import (
+            patch_object_storage_pull_files_lock,
+        )
+
+        patch_object_storage_pull_files_lock(mod)
+
+    if target_mod in sys.modules:
+        _patch_module(sys.modules[target_mod])
+        return
+
+    class _RunaiUtilsPostImportFinder(importlib.abc.MetaPathFinder):
+        _reentrant = False
+
+        def find_spec(self, fullname, path, target=None):
+            if fullname != target_mod or self._reentrant:
+                return None
+            self._reentrant = True
+            try:
+                spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+                if spec is None or spec.loader is None:
+                    for finder in sys.meta_path:
+                        if finder is self or not hasattr(finder, "find_spec"):
+                            continue
+                        spec = finder.find_spec(fullname, path, target)
+                        if spec is not None and spec.loader is not None:
+                            break
+                if spec is None or spec.loader is None:
+                    return None
+                orig_loader = spec.loader
+
+                class _WrappedLoader(importlib.abc.Loader):
+                    def create_module(self, s):
+                        if hasattr(orig_loader, "create_module"):
+                            return orig_loader.create_module(s)
+                        return None
+
+                    def exec_module(self, module):
+                        orig_loader.exec_module(module)
+                        _patch_module(module)
+
+                spec.loader = _WrappedLoader()
+                return spec
+            finally:
+                self._reentrant = False
+
+    if not any(
+        getattr(f, "_tpu_runai_post_import", False) for f in sys.meta_path
+    ):
+        finder = _RunaiUtilsPostImportFinder()
+        finder._tpu_runai_post_import = True  # type: ignore[attr-defined]
+        sys.meta_path.insert(0, finder)
+
+
+_install_runai_pull_files_import_hook()
+
 from vllm_torchtpu import patch_registry  # noqa: E402
 
 patch_registry.apply("import")
