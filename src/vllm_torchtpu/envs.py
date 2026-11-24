@@ -228,6 +228,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
     VLLM_TPU_PREFILL_CADENCE_NO_ESCAPE: bool = False
     VLLM_TPU_SRPT_PROMOTE_WARM_WAITING: bool = False
+    VLLM_TPU_SRPT_SESSION_PRIORITY: bool = False
     VLLM_TPU_SHARED_PREFIX_CHECKPOINT: bool = False
     VLLM_TPU_MOE_EP_MAX_ROUTES: int = 0
     VLLM_TPU_MEGAKERNEL: str = ""
@@ -1398,6 +1399,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the waiting queue ahead of cold uncached prompts (with age anti-starvation).
     "VLLM_TPU_SRPT_PROMOTE_WARM_WAITING": env_bool(
         "VLLM_TPU_SRPT_PROMOTE_WARM_WAITING", default=False
+    ),
+    # SrptPrefillScheduler: 4-tier session-completing priority keeping warm
+    # multi-turn follow-ups and <32K requests ahead of cold >=32K Turn-0 arrivals
+    # while ordering >=32K cold Turn-0 buckets FCFS within [32K, 128K) and >=128K.
+    "VLLM_TPU_SRPT_SESSION_PRIORITY": env_bool(
+        "VLLM_TPU_SRPT_SESSION_PRIORITY", default=False
     ),
     # SrptPrefillScheduler: automatically detect and checkpoint sub-super-block
     # shared prompt prefixes (e.g. shared system prompts under hybrid Mamba + DCP)
