@@ -263,7 +263,6 @@ class _SharedMmapPrefixStore:
         prompt_len: int,
         cur: float,
     ) -> None:
-        self.advance_rr_cursor_unlocked()
         if prompt_len > 0:
             backlog = self.decay_backlog_unlocked(cur)
             matched = self.cached_tokens_by_engine_unlocked(digests)[eng_idx]
@@ -514,6 +513,7 @@ class _DPPrefixDirectory:
                     client_count
                 )
                 start_idx = self._shm_store.read_rr_cursor_unlocked()
+                self._shm_store.advance_rr_cursor_unlocked()
                 backlog = self._shm_store.decay_backlog_unlocked(cur)
                 counts = self._shm_store.read_engine_counts_unlocked()
                 cached = self._shm_store.cached_tokens_by_engine_unlocked(digests)

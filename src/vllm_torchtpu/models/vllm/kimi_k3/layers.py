@@ -141,12 +141,21 @@ class KimiMLP(nn.Module):
             raise ValueError(f"Unsupported Kimi activation {hidden_act!r}")
 
     def forward(
-        self, hidden_states: torch.Tensor, sequence_parallel: bool = False
+        self,
+        hidden_states: torch.Tensor,
+        sequence_parallel: bool = False,
+        *,
+        pre_gathered_input: torch.Tensor | None = None,
+        reduce_output: bool = True,
     ) -> torch.Tensor:
         group = self.tp_group
         if sequence_parallel:
             group = self.sp_group or group or get_tp_group()
-            hidden_states = group.all_gather(hidden_states, dim=0)
+            hidden_states = (
+                pre_gathered_input
+                if pre_gathered_input is not None
+                else group.all_gather(hidden_states, dim=0)
+            )
         hidden_states, _ = self.gate_up_proj(hidden_states)
         hidden_states = self.act_fn(hidden_states)
         if sequence_parallel or self.tp_group is not None:
@@ -154,6 +163,8 @@ class KimiMLP(nn.Module):
             hidden_states = self.down_proj.quant_method.apply(
                 self.down_proj, hidden_states, None
             )
+            if not reduce_output:
+                return hidden_states
             if sequence_parallel:
                 assert group is not None
                 return group.reduce_scatter(hidden_states, dim=0)

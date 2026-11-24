@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     TPU_K3_GENERIC_SP: bool = False
     TPU_K3_GENERIC_SP_MIN_TOKENS: int = 512
     TPU_K3_GENERIC_SP_SHARED_SUBGROUP: int = 8
+    TPU_K3_GENERIC_SP_MOE_CHUNKS: int = 1
     TPU_DCP_MLA_TOPK_CAP: int = 0
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
     TPU_DCP_LSE_MERGE_A2A: bool = False
@@ -475,6 +476,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "TPU_K3_GENERIC_SP_SHARED_SUBGROUP": env_nonnegative_int(
         "TPU_K3_GENERIC_SP_SHARED_SUBGROUP", 8
+    ),
+    "TPU_K3_GENERIC_SP_MOE_CHUNKS": env_nonnegative_int(
+        "TPU_K3_GENERIC_SP_MOE_CHUNKS", 1
     ),
     # DCP sparse MLA (SparseCore cache layout): gather and attend this many
     # top-k slots per token instead of all `topk`; tokens owning more are

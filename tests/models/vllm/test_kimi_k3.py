@@ -3337,3 +3337,223 @@ def test_cp_mla_merge_received_masks_nan_unowned_partials() -> None:
         merged[0], torch.full((2, 4), 2.0, dtype=torch.float32), atol=1e-2, rtol=1e-2
     )
     torch.testing.assert_close(merged[1], torch.zeros(2, 4, dtype=torch.float32))
+
+
+def test_intra_chip_column_parallel_linear_all_to_all_and_pre_gathered(
+    monkeypatch,
+) -> None:
+    """Verify IntraChipColumnParallelLinear's all_to_all SP path and
+    pre_gathered_input bypass match full matmul output bit-for-bit."""
+    import vllm_torchtpu.layers.adapter.latent_proj_intra_chip as lpic
+    from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import (
+        IntraChipColumnParallelLinear,
+    )
+
+    world_size = 4
+    in_dim, out_dim = 8, 12
+    col_per_rank = out_dim // world_size
+    tokens_per_rank = 3
+    torch.manual_seed(99)
+    full_x = torch.randn(world_size * tokens_per_rank, in_dim)
+    full_w = torch.randn(in_dim, out_dim)
+    expected_full = full_x @ full_w
+
+    all_outputs = [
+        full_x @ full_w[:, k * col_per_rank : (k + 1) * col_per_rank]
+        for k in range(world_size)
+    ]
+
+    for r in range(world_size):
+        w_r = full_w[:, r * col_per_rank : (r + 1) * col_per_rank]
+        ag_calls = [0]
+
+        def fake_ag(t: torch.Tensor, dim: int = 0) -> torch.Tensor:
+            ag_calls[0] += 1
+            return full_x
+
+        def fake_a2a(t: torch.Tensor, _group, _r=r) -> torch.Tensor:
+            # Block k of result came from rank k's _r-th token block.
+            return torch.cat(
+                [
+                    all_outputs[k][_r * tokens_per_rank : (_r + 1) * tokens_per_rank]
+                    for k in range(world_size)
+                ],
+                dim=0,
+            )
+
+        monkeypatch.setattr(lpic, "all_to_all", fake_a2a)
+        proj = IntraChipColumnParallelLinear.__new__(IntraChipColumnParallelLinear)
+        nn.Module.__init__(proj)
+        proj._chip_group = SimpleNamespace(
+            world_size=world_size,
+            rank_in_group=r,
+            device_group=object(),
+            all_gather=fake_ag,
+        )
+        proj.output_size = out_dim
+        proj.bias = None
+        proj.skip_bias_add = False
+        proj.quant_method = SimpleNamespace(
+            apply=lambda _layer, inp, _bias, _w=w_r: inp @ _w
+        )
+
+        x_r = full_x[r * tokens_per_rank : (r + 1) * tokens_per_rank]
+        out_r, _ = proj(x_r, sequence_parallel=True, pre_gathered_input=full_x)
+        assert ag_calls[0] == 0
+        torch.testing.assert_close(
+            out_r,
+            expected_full[r * tokens_per_rank : (r + 1) * tokens_per_rank],
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+
+def test_kimi_moe_generic_sp_fused_up_proj_and_chunked_moe(monkeypatch) -> None:
+    """Verify KimiMoE._forward_expert_parallel fuses subgroup RowParallelLinear
+    up_proj + shared_experts and produces identical outputs for sp_moe_chunks=1
+    and sp_moe_chunks=2 in both SP prefill and non-SP decode."""
+    import vllm_torchtpu.models.vllm.kimi_k3.moe as moe_mod
+    from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import (
+        IntraChipColumnParallelLinear,
+    )
+    from vllm_torchtpu.models.vllm.kimi_k3.collective_ops import GenericSPCollectives
+    from vllm_torchtpu.models.vllm.kimi_k3.moe import KimiMoE
+
+    sub_ws = 4
+    S_local = 4
+    H, E_H, n_exp = 12, 8, 16
+    in_part = E_H // sub_ws
+    down_part = E_H // sub_ws
+    torch.manual_seed(123)
+    full_hidden = torch.randn(sub_ws * S_local, H)
+    w_down = torch.randn(H, E_H)
+    w_up = torch.randn(E_H, H)
+    w_shared = torch.randn(H, H)
+    w_routed = torch.randn(E_H, E_H)
+
+    expected_latent = full_hidden @ w_down
+    expected_routed = expected_latent @ w_routed
+    expected_full = expected_routed @ w_up + full_hidden @ w_shared
+
+    monkeypatch.setattr(
+        moe_mod.moe_routing,
+        "route",
+        lambda _layer, lat, _logits, **_kw: (
+            torch.ones(lat.shape[0], 2),
+            torch.zeros(lat.shape[0], 2, dtype=torch.int32),
+        ),
+    )
+
+    def run_for_rank(r: int, *, sequence_parallel: bool, moe_chunks: int) -> torch.Tensor:
+        sub_ag_calls = [0]
+
+        def sub_ag(t: torch.Tensor, dim: int = 0) -> torch.Tensor:
+            if dim == 0:
+                if t.shape[-1] == H:
+                    sub_ag_calls[0] += 1
+                    return full_hidden
+                return expected_routed
+            return expected_latent
+
+        def sub_rs(t: torch.Tensor, dim: int = 0) -> torch.Tensor:
+            assert dim == 0
+            # Reconstruct sum across all 4 subgroup ranks' partials for rank r's tokens.
+            total = torch.zeros_like(t)
+            for k in range(sub_ws):
+                up_k = (
+                    expected_routed[:, k * in_part : (k + 1) * in_part]
+                    @ w_up[k * in_part : (k + 1) * in_part, :]
+                )
+                sh_k = full_hidden @ (w_shared / sub_ws)
+                total = total + up_k + sh_k
+            return total[r * S_local : (r + 1) * S_local]
+
+        def sub_ar(t: torch.Tensor) -> torch.Tensor:
+            total = torch.zeros_like(t)
+            for k in range(sub_ws):
+                up_k = (
+                    expected_routed[:, k * in_part : (k + 1) * in_part]
+                    @ w_up[k * in_part : (k + 1) * in_part, :]
+                )
+                sh_k = full_hidden @ (w_shared / sub_ws)
+                total = total + up_k + sh_k
+            return total
+
+        sub_group = SimpleNamespace(
+            world_size=sub_ws,
+            rank_in_group=r,
+            all_gather=sub_ag,
+            reduce_scatter=sub_rs,
+            all_reduce=sub_ar,
+        )
+
+        down = IntraChipColumnParallelLinear.__new__(IntraChipColumnParallelLinear)
+        nn.Module.__init__(down)
+        down._chip_group = sub_group
+        down.output_size = E_H
+        down.bias = None
+        down.skip_bias_add = False
+        down.quant_method = SimpleNamespace(
+            apply=lambda _l, inp, _b: inp @ w_down[:, r * down_part : (r + 1) * down_part]
+        )
+
+        up_w_r = w_up[r * in_part : (r + 1) * in_part, :]
+        up = SimpleNamespace(
+            input_size_per_partition=in_part,
+            quant_method=SimpleNamespace(apply=lambda _l, inp, _b: inp @ up_w_r),
+        )
+
+        def fake_shared(hs, sequence_parallel=False, *, pre_gathered_input=None, reduce_output=True):
+            assert not reduce_output
+            if sequence_parallel:
+                assert pre_gathered_input is not None
+                return pre_gathered_input @ (w_shared / sub_ws)
+            return hs @ (w_shared / sub_ws)
+
+        prefill_group = GenericSPCollectives.__new__(GenericSPCollectives)
+        prefill_group.gather_moe_inputs = (  # type: ignore[method-assign]
+            lambda lat, w, ids, *, num_experts, sequence_parallel=True: (lat, w, ids)
+        )
+        prefill_group.reduce_moe_output = (  # type: ignore[method-assign]
+            lambda out, *, sequence_parallel=True: out
+        )
+
+        routed_method = SimpleNamespace(
+            _tpu_topk_weights_float32=False,
+            apply_with_routing=lambda _r, lat, _w, _i, **_kw: lat @ w_routed,
+        )
+
+        moe = KimiMoE.__new__(KimiMoE)
+        nn.Module.__init__(moe)
+        moe.prefill_group = prefill_group
+        moe.shared_group = sub_group
+        moe.sp_moe_chunks = moe_chunks
+        moe._fuse_generic_sp_up_proj = True
+        moe.gate = SimpleNamespace(
+            output_size=n_exp,
+            __call__=lambda x: (torch.zeros(x.shape[0], n_exp), None),
+        )
+        moe.gate = lambda x: (torch.zeros(x.shape[0], n_exp), None)  # type: ignore[assignment]
+        moe.gate.output_size = n_exp  # type: ignore[attr-defined]
+        moe.routed_expert_down_proj = down
+        moe.routed_expert_norm = None
+        moe.routed_expert_up_proj = up  # type: ignore[assignment]
+        moe.shared_experts = fake_shared  # type: ignore[assignment]
+        moe.experts = SimpleNamespace(
+            routed_experts=SimpleNamespace(quant_method=routed_method)
+        )
+
+        hs_in = full_hidden[r * S_local : (r + 1) * S_local] if sequence_parallel else full_hidden
+        out = moe._forward_expert_parallel(hs_in, sequence_parallel=sequence_parallel)
+        if sequence_parallel:
+            # Shared gather must run once per layer, not twice!
+            assert sub_ag_calls[0] == 1
+        return out
+
+    for r in range(sub_ws):
+        out_sp_1 = run_for_rank(r, sequence_parallel=True, moe_chunks=1)
+        out_sp_2 = run_for_rank(r, sequence_parallel=True, moe_chunks=2)
+        torch.testing.assert_close(out_sp_1, expected_full[r * S_local : (r + 1) * S_local], atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(out_sp_2, out_sp_1, atol=1e-5, rtol=1e-5)
+        out_dec = run_for_rank(r, sequence_parallel=False, moe_chunks=2)
+        torch.testing.assert_close(out_dec, expected_full, atol=1e-5, rtol=1e-5)

@@ -173,7 +173,10 @@ class SrptPrefillScheduler(AsyncScheduler):
     def _record_external_block_hashes(self, output: SchedulerOutput) -> None:
         if self.connector is None or not output.num_scheduled_tokens:
             return
-        tokens_per_hash = max(int(self.cache_config.block_size or 1), 1)
+        tokens_per_hash = max(
+            int(getattr(self, "hash_block_size", 0) or self.cache_config.block_size or 1),
+            1,
+        )
         ext = self._external_block_hashes
         for req_id, n_sched in output.num_scheduled_tokens.items():
             if n_sched <= 0:
@@ -212,7 +215,10 @@ class SrptPrefillScheduler(AsyncScheduler):
             matched_blocks += 1
         if matched_blocks <= 0:
             return local_hit_tokens
-        tokens_per_hash = max(int(self.cache_config.block_size or 1), 1)
+        tokens_per_hash = max(
+            int(getattr(self, "hash_block_size", 0) or self.cache_config.block_size or 1),
+            1,
+        )
         ext_tokens = min(
             matched_blocks * tokens_per_hash,
             max(request.num_prompt_tokens - 1, 0),

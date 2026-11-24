@@ -499,6 +499,31 @@ class TestDPPrefixDirectory(unittest.TestCase):
                     if getattr(c1, "_tpu_dp_prefix_dir", None):
                         c1._tpu_dp_prefix_dir.close()
 
+    def test_simultaneous_cold_burst_advances_rr_cursor_in_select_engine(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shm_path = os.path.join(tmpdir, "prefix_burst.shm")
+            dirs = [
+                _DPPrefixDirectory(num_engines=4, chunk_tokens=256, shm_path=shm_path)
+                for _ in range(4)
+            ]
+            try:
+                chosen = []
+                for cid in range(4):
+                    eng, _ = dirs[cid].select_engine(
+                        prompt_token_ids=[cid * 10_000 + j for j in range(1024)],
+                        lb_engines=[(0, 0, 0.0)] * 4,
+                        inflight_by_idx=[0, 0, 0, 0],
+                        client_count=4,
+                        eng_start_index=0,
+                        client_index=cid,
+                        now=50.0,
+                    )
+                    chosen.append(eng)
+                self.assertEqual(chosen, [0, 1, 2, 3])
+            finally:
+                for d in dirs:
+                    d.close()
+
 
 if __name__ == "__main__":
     unittest.main()

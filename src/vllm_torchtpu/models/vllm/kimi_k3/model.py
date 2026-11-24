@@ -244,6 +244,9 @@ class KimiModel(nn.Module):
         self.sp_min_tokens = (
             max(1, envs.TPU_K3_GENERIC_SP_MIN_TOKENS) if self.generic_sp else 1
         )
+        self.sp_moe_chunks = (
+            max(1, envs.TPU_K3_GENERIC_SP_MOE_CHUNKS) if self.generic_sp else 1
+        )
         if self.sp_prefill:
             assert parallel is not None
             if (
@@ -258,11 +261,12 @@ class KimiModel(nn.Module):
             self.sp_group = GenericSPCollectives(get_tp_group())
             logger.info(
                 "Enabled generic Kimi K3 SP prefill: tp_size=%d, dp_size=%d, "
-                "min_tokens=%d, shared_subgroup=%d",
+                "min_tokens=%d, shared_subgroup=%d, moe_chunks=%d",
                 parallel.tensor_parallel_size,
                 parallel.data_parallel_size,
                 self.sp_min_tokens,
                 envs.TPU_K3_GENERIC_SP_SHARED_SUBGROUP,
+                self.sp_moe_chunks,
             )
 
         dsa = kimi_dsa_config(config)
@@ -317,10 +321,11 @@ class KimiModel(nn.Module):
         num_tokens = hidden_states.shape[0]
         generic_sp = getattr(self, "generic_sp", False)
         sp_min_tokens = getattr(self, "sp_min_tokens", 1) if generic_sp else 1
+        sp_moe_chunks = getattr(self, "sp_moe_chunks", 1) if generic_sp else 1
         sequence_parallel = (
             (self.sp_prefill or generic_sp)
             and num_tokens >= sp_min_tokens
-            and num_tokens % self.sp_group.world_size == 0
+            and num_tokens % (self.sp_group.world_size * sp_moe_chunks) == 0
         )
         padding_mask: torch.Tensor | None = None
         if generic_sp and token_padding._padding_state is not None:

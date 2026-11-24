@@ -16,7 +16,9 @@
 from __future__ import annotations
 
 import zlib
+from contextlib import ExitStack
 from typing import TYPE_CHECKING, cast
+from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -35,6 +37,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.collectives import all_to_all
 from vllm_torchtpu.distributed.intra_chip import get_intra_chip_group, get_tp_subgroup
 from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import (
@@ -72,6 +75,22 @@ class KimiRoutedOutputTransform(nn.Module):
             hidden_states = self.norm(hidden_states)
         hidden_states, _ = self.up_proj(hidden_states)
         return hidden_states
+
+
+def _subgroup_feature_to_token_a2a(
+    x: torch.Tensor, group, part: int
+) -> torch.Tensor:
+    """Redistribute ``[S_local, W * part]`` across ``group`` into ``[W * S_local, part]``."""
+    ws = int(group.world_size)
+    if ws <= 1:
+        return x
+    if getattr(group, "device_group", None) is not None:
+        return all_to_all(
+            x.unflatten(-1, (ws, part)).movedim(0, 1).reshape(-1, part),
+            group,
+        )
+    rank = int(group.rank_in_group)
+    return group.all_gather(x, dim=0).narrow(-1, rank * part, part).contiguous()
 
 
 class KimiMoE(nn.Module):
@@ -153,6 +172,42 @@ class KimiMoE(nn.Module):
             if self.routed_expert_down_proj is not None and config.latent_moe_use_norm
             else None
         )
+
+        self.prefill_group = None
+        self.shared_group = None
+        self.sp_moe_chunks = 1
+        if envs.TPU_K3_SP_PREFILL:
+            self.prefill_group = FusedPrefillCollectives(prefix)
+            self.shared_group = get_intra_chip_group()
+            if self.shared_group is None or self.shared_group.world_size != 2:
+                raise ValueError("K3 SP prefill needs a physical two-core chip group")
+        elif self.generic_sp:
+            from vllm.distributed import get_tp_group
+
+            self.prefill_group = GenericSPCollectives()
+            self.sp_moe_chunks = max(1, envs.TPU_K3_GENERIC_SP_MOE_CHUNKS)
+            shared_interm = config.moe_intermediate_size * config.num_shared_experts
+            sub_sz = envs.TPU_K3_GENERIC_SP_SHARED_SUBGROUP
+            subgroup = (
+                get_tp_subgroup(sub_sz)
+                if (
+                    sub_sz >= 2
+                    and sub_sz < self.tp_size
+                    and shared_interm > 0
+                    and shared_interm % sub_sz == 0
+                )
+                else None
+            )
+            self.shared_group = subgroup if subgroup is not None else get_tp_group()
+
+        self._fuse_generic_sp_up_proj = (
+            self.generic_sp
+            and routed_expert_hidden_size is not None
+            and self.shared_group is not None
+            and int(self.shared_group.world_size) > 1
+            and expert_hidden_size % int(self.shared_group.world_size) == 0
+        )
+
         if self.routed_expert_down_proj is None:
             self.routed_expert_up_proj = None
         elif self._fuse_tp_up_proj:
@@ -179,6 +234,30 @@ class KimiMoE(nn.Module):
                 torch.tensor([self.tp_rank], dtype=torch.long),
                 persistent=False,
             )
+        elif self._fuse_generic_sp_up_proj:
+            assert self.shared_group is not None
+            with ExitStack() as stack:
+                module = "vllm.model_executor.layers.linear"
+                stack.enter_context(
+                    patch(
+                        f"{module}.get_tensor_model_parallel_rank",
+                        return_value=self.shared_group.rank_in_group,
+                    )
+                )
+                stack.enter_context(
+                    patch(
+                        f"{module}.get_tensor_model_parallel_world_size",
+                        return_value=self.shared_group.world_size,
+                    )
+                )
+                self.routed_expert_up_proj = RowParallelLinear(
+                    expert_hidden_size,
+                    hidden_size,
+                    bias=False,
+                    quant_config=quant_config,
+                    reduce_results=False,
+                    prefix=f"{prefix}.routed_expert_up_proj",
+                )
         else:
             self.routed_expert_up_proj = make_latent_projection(
                 expert_hidden_size,
@@ -193,34 +272,13 @@ class KimiMoE(nn.Module):
             KimiRoutedOutputTransform(
                 self.routed_expert_norm, self.routed_expert_up_proj
             )
-            if (self.routed_expert_up_proj is not None and not self._fuse_tp_up_proj)
+            if (
+                self.routed_expert_up_proj is not None
+                and not self._fuse_tp_up_proj
+                and not self._fuse_generic_sp_up_proj
+            )
             else None
         )
-
-        self.prefill_group = None
-        self.shared_group = None
-        if envs.TPU_K3_SP_PREFILL:
-            self.prefill_group = FusedPrefillCollectives(prefix)
-            self.shared_group = get_intra_chip_group()
-            if self.shared_group is None or self.shared_group.world_size != 2:
-                raise ValueError("K3 SP prefill needs a physical two-core chip group")
-        elif self.generic_sp:
-            from vllm.distributed import get_tp_group
-
-            self.prefill_group = GenericSPCollectives()
-            shared_interm = config.moe_intermediate_size * config.num_shared_experts
-            sub_sz = envs.TPU_K3_GENERIC_SP_SHARED_SUBGROUP
-            subgroup = (
-                get_tp_subgroup(sub_sz)
-                if (
-                    sub_sz >= 2
-                    and sub_sz < self.tp_size
-                    and shared_interm > 0
-                    and shared_interm % sub_sz == 0
-                )
-                else None
-            )
-            self.shared_group = subgroup if subgroup is not None else get_tp_group()
 
         self.shared_experts = (
             KimiMLP(
@@ -260,7 +318,11 @@ class KimiMoE(nn.Module):
         # within one chip, instead of vLLM's flat all-experts-per-device EP.
         with hierarchical_moe_parallel_config():
             self.experts = FusedMoEFactory(
-                shared_experts=(None if self._fuse_tp_up_proj else self.shared_experts),
+                shared_experts=(
+                    None
+                    if (self._fuse_tp_up_proj or self._fuse_generic_sp_up_proj)
+                    else self.shared_experts
+                ),
                 num_experts=config.num_experts,
                 top_k=config.num_experts_per_token,
                 hidden_size=expert_hidden_size,
@@ -383,11 +445,27 @@ class KimiMoE(nn.Module):
         group = self.prefill_group
         assert group is not None
         router_logits, _ = self.gate(hidden_states)
+        shared_group = getattr(self, "shared_group", None)
+        down_group = getattr(self.routed_expert_down_proj, "_chip_group", None)
+        share_sub_gather = (
+            sequence_parallel
+            and shared_group is not None
+            and down_group is shared_group
+            and int(shared_group.world_size) > 1
+            and self.shared_experts is not None
+        )
+        sub_hidden = (
+            shared_group.all_gather(hidden_states, dim=0)
+            if share_sub_gather
+            else None
+        )
         latent = hidden_states
         if self.routed_expert_down_proj is not None:
             if isinstance(self.routed_expert_down_proj, IntraChipColumnParallelLinear):
                 latent, _ = self.routed_expert_down_proj(
-                    latent, sequence_parallel=sequence_parallel
+                    latent,
+                    sequence_parallel=sequence_parallel,
+                    pre_gathered_input=sub_hidden,
                 )
             else:
                 latent, _ = self.routed_expert_down_proj(latent)
@@ -406,22 +484,62 @@ class KimiMoE(nn.Module):
                 weights = torch.where(
                     padding_mask[:, None], torch.zeros_like(weights), weights
                 )
-            latent, weights, ids = group.gather_moe_inputs(
-                latent,
-                weights,
-                ids,
-                num_experts=self.gate.output_size,
-                sequence_parallel=sequence_parallel,
-            )
-            output = method.apply_with_routing(
-                routed,
-                latent,
-                weights,
-                ids,
-                pipelined=False,
-                padding_already_zeroed=padding_mask is not None,
-            )
-            output = group.reduce_moe_output(output, sequence_parallel=sequence_parallel)
+            moe_chunks = getattr(self, "sp_moe_chunks", 1) if sequence_parallel else 1
+            if moe_chunks > 1:
+                latent_chunks = latent.reshape(moe_chunks, -1, latent.shape[-1])
+                weight_chunks = weights.reshape(moe_chunks, -1, weights.shape[-1])
+                id_chunks = ids.reshape(moe_chunks, -1, ids.shape[-1])
+                ag_curr = group.gather_moe_inputs(
+                    latent_chunks[0],
+                    weight_chunks[0],
+                    id_chunks[0],
+                    num_experts=self.gate.output_size,
+                    sequence_parallel=True,
+                )
+                rs_outputs = []
+                for idx in range(moe_chunks):
+                    ag_next = None
+                    if idx + 1 < moe_chunks:
+                        ag_next = group.gather_moe_inputs(
+                            latent_chunks[idx + 1],
+                            weight_chunks[idx + 1],
+                            id_chunks[idx + 1],
+                            num_experts=self.gate.output_size,
+                            sequence_parallel=True,
+                        )
+                    out_i = method.apply_with_routing(
+                        routed,
+                        ag_curr[0],
+                        ag_curr[1],
+                        ag_curr[2],
+                        pipelined=False,
+                        padding_already_zeroed=padding_mask is not None,
+                    )
+                    rs_outputs.append(
+                        group.reduce_moe_output(out_i, sequence_parallel=True)
+                    )
+                    if ag_next is not None:
+                        ag_curr = ag_next
+                output = torch.cat(rs_outputs, dim=0)
+            else:
+                latent, weights, ids = group.gather_moe_inputs(
+                    latent,
+                    weights,
+                    ids,
+                    num_experts=self.gate.output_size,
+                    sequence_parallel=sequence_parallel,
+                )
+                output = method.apply_with_routing(
+                    routed,
+                    latent,
+                    weights,
+                    ids,
+                    pipelined=False,
+                    padding_already_zeroed=padding_mask is not None,
+                )
+                output = group.reduce_moe_output(
+                    output, sequence_parallel=sequence_parallel
+                )
         else:
             if sequence_parallel:
                 method = cast(
@@ -448,6 +566,40 @@ class KimiMoE(nn.Module):
             )
         if self.routed_expert_norm is not None:
             output = self.routed_expert_norm(output)
+        if getattr(self, "_fuse_generic_sp_up_proj", False):
+            assert self.routed_expert_up_proj is not None
+            assert self.shared_group is not None
+            sub_ws = int(self.shared_group.world_size)
+            sub_rank = int(self.shared_group.rank_in_group)
+            in_part = int(self.routed_expert_up_proj.input_size_per_partition)
+            if sequence_parallel:
+                up_in = _subgroup_feature_to_token_a2a(
+                    output, self.shared_group, in_part
+                )
+            else:
+                up_in = (
+                    output.narrow(-1, sub_rank * in_part, in_part)
+                    if sub_ws > 1
+                    else output
+                )
+            up_partial = self.routed_expert_up_proj.quant_method.apply(
+                self.routed_expert_up_proj, up_in, None
+            )
+            if self.shared_experts is not None:
+                shared_partial = self.shared_experts(
+                    hidden_states,
+                    sequence_parallel=sequence_parallel,
+                    pre_gathered_input=sub_hidden,
+                    reduce_output=False,
+                )
+                combined = up_partial + shared_partial
+            else:
+                combined = up_partial
+            return (
+                self.shared_group.reduce_scatter(combined, dim=0)
+                if sequence_parallel
+                else self.shared_group.all_reduce(combined)
+            )
         if self.routed_expert_up_proj is not None:
             if isinstance(self.routed_expert_up_proj, IntraChipColumnParallelLinear):
                 output, _ = self.routed_expert_up_proj(
@@ -457,6 +609,8 @@ class KimiMoE(nn.Module):
                 output, _ = self.routed_expert_up_proj(output)
         if self.shared_experts is not None:
             output = output + self.shared_experts(
-                hidden_states, sequence_parallel=sequence_parallel
+                hidden_states,
+                sequence_parallel=sequence_parallel,
+                pre_gathered_input=sub_hidden,
             )
         return output
