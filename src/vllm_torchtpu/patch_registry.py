@@ -120,6 +120,10 @@ PATCHES = (
         _ACTIVE,
     ),
     Patch(
+        "vllm_torchtpu.model_loader_patches:patch_object_storage_pull_files_lock",
+        _ENGINE,
+    ),
+    Patch(
         "vllm_torchtpu.model_loader_patches:patch_runai_sharded_expert_streaming",
         _ACTIVE,
     ),

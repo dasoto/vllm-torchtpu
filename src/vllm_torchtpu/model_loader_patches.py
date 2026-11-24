@@ -1113,3 +1113,76 @@ def patch_expert_placement_routers() -> None:
         typing.Any, process_weights_after_loading
     )._tpu_renumbers_expert_routers = True
     base_loader.process_weights_after_loading = process_weights_after_loading
+
+
+def patch_object_storage_pull_files_lock() -> None:
+    """Serialize and atomically stage ``ObjectStorageModel.pull_files`` across processes.
+
+    With ``--api-server-count > 1``, multiple ``ApiServer`` and ``EngineCore``
+    processes on the head host call ``ObjectStorageModel(url).pull_files(...)``
+    into the same ``model_streamer/<hash>`` directory concurrently, causing
+    in-place file truncation races during ``json.loads`` on config/tokenizer JSONs.
+    """
+    import fcntl
+    import hashlib
+    import tempfile
+    from vllm.transformers_utils import runai_utils
+
+    cls = getattr(runai_utils, "ObjectStorageModel", None)
+    if cls is None or getattr(cls.pull_files, "_tpu_pull_files_lock_patch", False):
+        return
+
+    orig_pull_files = cls.pull_files
+
+    @functools.wraps(orig_pull_files)
+    def pull_files(
+        self,
+        model_path: str = "",
+        allow_pattern: list[str] | None = None,
+        ignore_pattern: list[str] | None = None,
+    ) -> None:
+        norm_path = model_path if model_path.endswith("/") else model_path + "/"
+        abs_dir = os.path.abspath(self.dir)
+        parent_dir = os.path.dirname(abs_dir)
+        os.makedirs(parent_dir, exist_ok=True)
+        os.makedirs(abs_dir, exist_ok=True)
+        lock_path = f"{abs_dir}.pull.lock"
+        key_repr = repr(
+            (
+                norm_path,
+                tuple(allow_pattern) if allow_pattern is not None else None,
+                tuple(ignore_pattern) if ignore_pattern is not None else None,
+            )
+        )
+        key_hash = hashlib.sha256(key_repr.encode("utf-8")).hexdigest()[:16]
+        done_marker = os.path.join(abs_dir, f".tpu_pull_done_{key_hash}")
+        with open(lock_path, "a+", encoding="utf-8") as lock_fh:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            try:
+                if os.path.exists(done_marker) and any(
+                    not fn.startswith(".") for fn in os.listdir(abs_dir)
+                ):
+                    return
+                with tempfile.TemporaryDirectory(
+                    prefix=".stage_pull_", dir=parent_dir
+                ) as stage_dir:
+                    runai_utils.runai_pull_files(
+                        norm_path, stage_dir, allow_pattern, ignore_pattern
+                    )
+                    for root, _, files in os.walk(stage_dir):
+                        rel = os.path.relpath(root, stage_dir)
+                        dst_root = (
+                            abs_dir if rel == "." else os.path.join(abs_dir, rel)
+                        )
+                        os.makedirs(dst_root, exist_ok=True)
+                        for fn in files:
+                            os.replace(
+                                os.path.join(root, fn), os.path.join(dst_root, fn)
+                            )
+                with open(done_marker, "w", encoding="utf-8") as mf:
+                    mf.write("ok\n")
+            finally:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+    typing.cast(typing.Any, pull_files)._tpu_pull_files_lock_patch = True
+    cls.pull_files = pull_files
