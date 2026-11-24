@@ -91,10 +91,19 @@ class IntraChipColumnParallelLinear(ColumnParallelLinear):
     def forward(  # type: ignore[override]
         self,
         input_: torch.Tensor,
+        sequence_parallel: bool = False,
     ) -> tuple[torch.Tensor, torch.nn.Parameter | None]:
         bias = self.bias if not self.skip_bias_add else None
-        output_parallel = self.quant_method.apply(self, input_, bias)
-        output = self._chip_group.all_gather(output_parallel, dim=-1)
+        if sequence_parallel and self._chip_group.world_size > 1:
+            gathered_in = self._chip_group.all_gather(input_, dim=0)
+            output_parallel = self.quant_method.apply(self, gathered_in, bias)
+            gathered_out = self._chip_group.all_gather(output_parallel, dim=-1)
+            output = gathered_out.reshape(
+                self._chip_group.world_size, -1, self.output_size
+            )[self._chip_group.rank_in_group].contiguous()
+        else:
+            output_parallel = self.quant_method.apply(self, input_, bias)
+            output = self._chip_group.all_gather(output_parallel, dim=-1)
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 

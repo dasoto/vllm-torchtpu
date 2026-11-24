@@ -3253,3 +3253,87 @@ def test_tpu_device_communicator_functional_all_gather_and_reduce_scatter(
 
     rs_last = comm.reduce_scatter(torch.cat(ranks_x, dim=-1), dim=-1)
     torch.testing.assert_close(rs_last, sum(ranks_x))
+
+
+def test_intra_chip_column_parallel_linear_sequence_parallel() -> None:
+    """Verify IntraChipColumnParallelLinear preserves per-token ownership under
+    sequence_parallel=True instead of concatenating columns from distinct
+    per-rank token slices."""
+    from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import (
+        IntraChipColumnParallelLinear,
+    )
+
+    world_size = 4
+    in_dim, out_dim = 8, 12
+    col_per_rank = out_dim // world_size
+    tokens_per_rank = 3
+    torch.manual_seed(42)
+    full_x = torch.randn(world_size * tokens_per_rank, in_dim)
+    full_w = torch.randn(in_dim, out_dim)
+    expected_full = full_x @ full_w
+
+    for r in range(world_size):
+        w_r = full_w[:, r * col_per_rank : (r + 1) * col_per_rank]
+
+        def fake_all_gather(t: torch.Tensor, dim: int = 0) -> torch.Tensor:
+            if dim == 0:
+                return full_x
+            assert dim in (-1, 1)
+            return torch.cat(
+                [
+                    full_x @ full_w[:, k * col_per_rank : (k + 1) * col_per_rank]
+                    for k in range(world_size)
+                ],
+                dim=-1,
+            )
+
+        proj = IntraChipColumnParallelLinear.__new__(IntraChipColumnParallelLinear)
+        nn.Module.__init__(proj)
+        proj._chip_group = SimpleNamespace(
+            world_size=world_size,
+            rank_in_group=r,
+            all_gather=fake_all_gather,
+        )
+        proj.output_size = out_dim
+        proj.bias = None
+        proj.skip_bias_add = False
+        proj.quant_method = SimpleNamespace(
+            apply=lambda _layer, inp, _bias, _w=w_r: inp @ _w
+        )
+
+        x_r = full_x[r * tokens_per_rank : (r + 1) * tokens_per_rank]
+        out_r, bias_r = proj(x_r, sequence_parallel=True)
+        assert bias_r is None
+        torch.testing.assert_close(
+            out_r,
+            expected_full[r * tokens_per_rank : (r + 1) * tokens_per_rank],
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+
+def test_cp_mla_merge_received_masks_nan_unowned_partials() -> None:
+    """Verify _merge_received masks out NaN partial outputs from DCP ranks with
+    lse == -inf (zero owned top-k keys) instead of propagating NaN * 0 = NaN."""
+    from vllm_torchtpu.layers.adapter.cp_mla_attention import _merge_received
+
+    # 4 DCP ranks, 2 tokens, 2 heads, vdim=4.
+    o_recv = torch.ones(4, 2, 2, 4, dtype=torch.bfloat16)
+    o_recv[1] = 3.0
+    # Ranks 2 and 3 own no keys for token 0 -> kernel dummy row decodes to NaN
+    # and sets lse = -inf.
+    o_recv[2, 0] = float("nan")
+    o_recv[3, 0] = float("nan")
+    # Token 1 is padding -> all ranks have lse = -inf and NaN partial output.
+    o_recv[:, 1] = float("nan")
+
+    l_recv = torch.full((4, 2, 2), float("-inf"), dtype=torch.float32)
+    l_recv[0, 0] = 0.0
+    l_recv[1, 0] = 0.0  # Equal weights 0.5 and 0.5 -> expected merge = 2.0
+
+    merged = _merge_received(o_recv, l_recv)
+    assert torch.isfinite(merged).all()
+    torch.testing.assert_close(
+        merged[0], torch.full((2, 4), 2.0, dtype=torch.float32), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(merged[1], torch.zeros(2, 4, dtype=torch.float32))

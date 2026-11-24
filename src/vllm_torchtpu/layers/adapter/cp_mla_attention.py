@@ -207,7 +207,14 @@ def _merge_received(o_recv: torch.Tensor, l_recv: torch.Tensor) -> torch.Tensor:
     weights = weights / torch.where(denom > 0, denom, torch.ones_like(denom))
     # The compiler lowers multiply-then-sum to a dot that rounds f32 operands to
     # bf16. Splitting the weights into a bf16 part and a residual keeps it exact.
-    o_f32 = o_recv.to(torch.float32)
+    # A zero-weight partial (unowned top-k, lse == -inf) attends a dummy cache
+    # row that may decode to fp8 NaN; guard before multiplying (NaN * 0 = NaN),
+    # matching `dcp_comm.weight_by_lse`.
+    o_f32 = torch.where(
+        finite.unsqueeze(-1),
+        o_recv.to(torch.float32),
+        torch.zeros_like(o_recv, dtype=torch.float32),
+    )
     w_hi = weights.to(torch.bfloat16).to(torch.float32)
     w_lo = weights - w_hi
     return (o_f32 * w_hi.unsqueeze(-1)).sum(dim=0) + (o_f32 * w_lo.unsqueeze(-1)).sum(
