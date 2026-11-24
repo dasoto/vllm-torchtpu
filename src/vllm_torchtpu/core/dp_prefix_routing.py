@@ -493,51 +493,15 @@ class _DPPrefixDirectory:
                 owners[d] = bit
                 counts[eng_idx] += 1
 
-    def select_engine(
+    def _score_best(
         self,
         *,
-        prompt_token_ids: list[int],
+        prompt_len: int,
+        cached: list[int],
         lb_engines: list[tuple[int, int, float]],
-        inflight_by_idx: list[int],
-        client_count: int,
-        eng_start_index: int,
-        client_index: int = 0,
-        now: float | None = None,
-    ) -> tuple[int, list[bytes]]:
-        digests = _rolling_chunk_digests(prompt_token_ids, self.chunk_tokens)
-        if self._shm_store is not None:
-            cur = time.monotonic() if now is None else now
-            with self._shm_store._lock():
-                self._shm_store.sync_client_inflight(client_index, inflight_by_idx)
-                eff_inflight = self._shm_store.read_global_inflight_unlocked(
-                    client_count
-                )
-                start_idx = self._shm_store.read_rr_cursor_unlocked()
-                self._shm_store.advance_rr_cursor_unlocked()
-                backlog = self._shm_store.decay_backlog_unlocked(cur)
-                counts = self._shm_store.read_engine_counts_unlocked()
-                cached = self._shm_store.cached_tokens_by_engine_unlocked(digests)
-                backlog_zeroed = False
-                for idx in range(self.num_engines):
-                    waiting, running, _ = lb_engines[idx]
-                    if (
-                        waiting == 0
-                        and running == 0
-                        and eff_inflight[idx] == 0
-                        and backlog[idx] > 0.0
-                    ):
-                        backlog[idx] = 0.0
-                        backlog_zeroed = True
-                if backlog_zeroed:
-                    self._shm_store.write_backlog_unlocked(backlog)
-                self._engine_prefill_backlog = backlog
-                self._engine_counts = counts
-        else:
-            self._decay_prefill_backlog(now)
-            cached = self.cached_tokens_by_engine(digests)
-            eff_inflight = [client_count * x for x in inflight_by_idx]
-            start_idx = eng_start_index % self.num_engines
-        prompt_len = len(prompt_token_ids)
+        eff_inflight: list[int],
+        start_idx: int,
+    ) -> int:
         max_cached = max(cached) if cached else 0
         long_warm_session = (
             max_cached >= _STICKY_LONG_PREFIX_TOKENS
@@ -587,7 +551,82 @@ class _DPPrefixDirectory:
                 best_cost = cost
                 best_idx = idx
                 best_tie = offset
+        return best_idx
 
+    def select_engine(
+        self,
+        *,
+        prompt_token_ids: list[int],
+        lb_engines: list[tuple[int, int, float]],
+        inflight_by_idx: list[int],
+        client_count: int,
+        eng_start_index: int,
+        client_index: int = 0,
+        now: float | None = None,
+        commit: bool = False,
+    ) -> tuple[int, list[bytes]]:
+        digests = _rolling_chunk_digests(prompt_token_ids, self.chunk_tokens)
+        prompt_len = len(prompt_token_ids)
+        if self._shm_store is not None:
+            cur = time.monotonic() if now is None else now
+            with self._shm_store._lock():
+                self._shm_store.sync_client_inflight(client_index, inflight_by_idx)
+                eff_inflight = self._shm_store.read_global_inflight_unlocked(
+                    client_count
+                )
+                start_idx = self._shm_store.read_rr_cursor_unlocked()
+                self._shm_store.advance_rr_cursor_unlocked()
+                backlog = self._shm_store.decay_backlog_unlocked(cur)
+                counts = self._shm_store.read_engine_counts_unlocked()
+                cached = self._shm_store.cached_tokens_by_engine_unlocked(digests)
+                backlog_zeroed = False
+                for idx in range(self.num_engines):
+                    waiting, running, _ = lb_engines[idx]
+                    if (
+                        waiting == 0
+                        and running == 0
+                        and eff_inflight[idx] == 0
+                        and backlog[idx] > 0.0
+                    ):
+                        backlog[idx] = 0.0
+                        backlog_zeroed = True
+                if backlog_zeroed:
+                    self._shm_store.write_backlog_unlocked(backlog)
+                self._engine_prefill_backlog = backlog
+                self._engine_counts = counts
+                best_idx = self._score_best(
+                    prompt_len=prompt_len,
+                    cached=cached,
+                    lb_engines=lb_engines,
+                    eff_inflight=eff_inflight,
+                    start_idx=start_idx,
+                )
+                if commit:
+                    post_inflight = list(inflight_by_idx)
+                    post_inflight[best_idx] += 1
+                    self._shm_store.sync_client_inflight(client_index, post_inflight)
+                    self._shm_store.record_unlocked(
+                        digests, best_idx, prompt_len, cur
+                    )
+                    self._engine_counts = self._shm_store.read_engine_counts_unlocked()
+                    self._engine_prefill_backlog = (
+                        self._shm_store.read_backlog_unlocked()
+                    )
+                return best_idx, digests
+
+        self._decay_prefill_backlog(now)
+        cached = self.cached_tokens_by_engine(digests)
+        eff_inflight = [client_count * x for x in inflight_by_idx]
+        start_idx = eng_start_index % self.num_engines
+        best_idx = self._score_best(
+            prompt_len=prompt_len,
+            cached=cached,
+            lb_engines=lb_engines,
+            eff_inflight=eff_inflight,
+            start_idx=start_idx,
+        )
+        if commit:
+            self.record(digests, best_idx, prompt_len=prompt_len, now=now)
         return best_idx, digests
 
 
@@ -662,6 +701,7 @@ def patch_dp_prefix_routing() -> None:
 
         client_idx = int(getattr(self, "client_index", 0))
         inflight_by_idx = [self.engine_inflight[eng] for eng in self.core_engines]
+        committed_in_shm = directory._shm_store is not None
         chosen_idx, digests = directory.select_engine(
             prompt_token_ids=request.prompt_token_ids,
             lb_engines=self.lb_engines,
@@ -669,6 +709,7 @@ def patch_dp_prefix_routing() -> None:
             client_count=self.client_count,
             eng_start_index=self.eng_start_index,
             client_index=client_idx,
+            commit=committed_in_shm,
         )
         request.data_parallel_rank = chosen_idx
         try:
@@ -679,7 +720,7 @@ def patch_dp_prefix_routing() -> None:
         # When process-local (shm disabled), update local lb_engines waiting count;
         # when shm is enabled, exact cross-process inflight counts in /dev/shm
         # already track burst arrivals between 100ms coordinator snapshots.
-        if directory._shm_store is None and 0 <= actual_idx < len(self.lb_engines):
+        if not committed_in_shm and 0 <= actual_idx < len(self.lb_engines):
             entry = self.lb_engines[actual_idx]
             if isinstance(entry, list):
                 entry[0] += self.client_count
@@ -690,14 +731,15 @@ def patch_dp_prefix_routing() -> None:
                     entry[2],
                 )
         self.eng_start_index = (self.eng_start_index + 1) % len(self.core_engines)
-        post_inflight = [self.engine_inflight[eng] for eng in self.core_engines]
-        directory.record(
-            digests,
-            actual_idx,
-            prompt_len=len(request.prompt_token_ids),
-            client_index=client_idx,
-            inflight_by_idx=post_inflight,
-        )
+        if not committed_in_shm or actual_idx != chosen_idx:
+            post_inflight = [self.engine_inflight[eng] for eng in self.core_engines]
+            directory.record(
+                digests,
+                actual_idx,
+                prompt_len=len(request.prompt_token_ids),
+                client_index=client_idx,
+                inflight_by_idx=post_inflight,
+            )
         return engine
 
     setattr(get_core_engine_for_request, marker, True)

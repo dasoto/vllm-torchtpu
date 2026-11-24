@@ -524,6 +524,38 @@ class TestDPPrefixDirectory(unittest.TestCase):
                 for d in dirs:
                     d.close()
 
+    def test_atomic_commit_prevents_multi_apiserver_toctou_pileup(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shm_path = os.path.join(tmpdir, "prefix_atomic.shm")
+            dirs = [
+                _DPPrefixDirectory(num_engines=8, chunk_tokens=512, shm_path=shm_path)
+                for _ in range(16)
+            ]
+            try:
+                # Seed uneven historical storage counts so scores are NOT tied.
+                with dirs[0]._shm_store._lock():
+                    dirs[0]._shm_store.write_engine_counts_unlocked(
+                        [2347, 2359, 2271, 2543, 2323, 2655, 2326, 2528]
+                    )
+                chosen = []
+                for cid in range(16):
+                    eng, _ = dirs[cid].select_engine(
+                        prompt_token_ids=[cid * 100_000 + j for j in range(65_536)],
+                        lb_engines=[(0, 0, 0.0)] * 8,
+                        inflight_by_idx=[0] * 8,
+                        client_count=16,
+                        eng_start_index=0,
+                        client_index=cid,
+                        now=100.0,
+                        commit=True,
+                    )
+                    chosen.append(eng)
+                per_eng = [chosen.count(e) for e in range(8)]
+                self.assertEqual(per_eng, [2, 2, 2, 2, 2, 2, 2, 2])
+            finally:
+                for d in dirs:
+                    d.close()
+
 
 if __name__ == "__main__":
     unittest.main()
