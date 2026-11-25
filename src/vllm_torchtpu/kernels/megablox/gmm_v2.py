@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any, cast
@@ -1037,22 +1038,25 @@ def calculate_tiling(
     bf16_bf16_tile_m = 128
     rhs_mod = min(pl.cdiv(16, rhs_bits), 2)
     tile_m = bf16_bf16_tile_m // rhs_mod
-    use_v6e_fp4_prefill_buckets = (
+    is_v6e_fp4 = (
         not lhs_cfgs.should_quantize
         and rhs_dtype == jnp.float4_e2m1fn
         and getattr(tpu_info, "generation", 7) < 7
-        and dims.size_m > 8192
     )
+    use_v6e_fp4_prefill_buckets = is_v6e_fp4 and dims.size_m > 8192
     if lhs_cfgs.should_quantize:
         tile_m *= 2
     elif use_v6e_fp4_prefill_buckets:
         # On TPU < v7, float4_e2m1fn runs on the BF16 MXU after software unpack
         # rather than a 2x-throughput FP4 MXU. On large prefill batches
-        # (size_m > 8192), using 2 buckets [512, 1024] cuts expert weight HBM
-        # DMA and unpack 4x on hot shards while halving Pallas switch-branch
-        # instruction overlays (2 branches vs 4) so prefill + decode programs
-        # remain co-resident in HBM without PJRT eviction.
-        tile_m = 512
+        # (size_m > 8192), using 1-2 buckets (e.g. [1024] or [512, 1024]) cuts
+        # expert weight HBM DMA and unpack on hot shards while shrinking Pallas
+        # switch-branch instruction overlays so prefill + decode programs remain
+        # co-resident in HBM without PJRT eviction or >3.5 GiB overlay overflow.
+        prefill_tile_m_override = int(
+            os.environ.get("TPU_GMM_V6E_PREFILL_TILE_M", "0") or "0"
+        )
+        tile_m = prefill_tile_m_override if prefill_tile_m_override > 0 else 512
     tile_m = min(tile_m, dims.size_m)
 
     # To avoid stalling MXU, we add some buffer room where tile_n cannot go
@@ -1151,7 +1155,22 @@ def calculate_tiling(
 
     # TODO(alynie, kyuyeunk): max number of bucket was choosen empiirically.
     # Revisit the value to be based on number of instruction memory size.
-    max_num_buckets = 2 if use_v6e_fp4_prefill_buckets else 4
+    if use_v6e_fp4_prefill_buckets:
+        prefill_max_buckets_override = int(
+            os.environ.get("TPU_GMM_V6E_PREFILL_MAX_BUCKETS", "0") or "0"
+        )
+        max_num_buckets = (
+            prefill_max_buckets_override if prefill_max_buckets_override > 0 else 2
+        )
+    elif is_v6e_fp4:
+        decode_max_buckets_override = int(
+            os.environ.get("TPU_GMM_V6E_DECODE_MAX_BUCKETS", "0") or "0"
+        )
+        max_num_buckets = (
+            decode_max_buckets_override if decode_max_buckets_override > 0 else 4
+        )
+    else:
+        max_num_buckets = 4
     bucket_base = tile_m
     for _ in range(1, max_num_buckets):
         new_tile_m = tile_m + bucket_base

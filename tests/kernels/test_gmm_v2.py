@@ -155,6 +155,25 @@ def test_calculate_tiling_v6e_fp4_prefill_uses_1024_tile_m(monkeypatch):
         tile_m=256, tile_k=3584, tile_n=3072, bucket_base=64
     )
 
+    monkeypatch.setenv("TPU_GMM_V6E_PREFILL_TILE_M", "1024")
+    monkeypatch.setenv("TPU_GMM_V6E_PREFILL_MAX_BUCKETS", "1")
+    monkeypatch.setenv("TPU_GMM_V6E_DECODE_MAX_BUCKETS", "2")
+    single_bucket_prefill = calculate_tiling(
+        prefill_dims, lhs_cfgs, rhs_cfgs, vmem_limit, fuse_act="situ:4.0:25.0"
+    )
+    assert single_bucket_prefill == TileSizes(
+        tile_m=1024, tile_k=3584, tile_n=3072, bucket_base=1024
+    )
+    two_bucket_decode = calculate_tiling(
+        decode_dims, lhs_cfgs, rhs_cfgs, vmem_limit, fuse_act="situ:4.0:25.0"
+    )
+    assert two_bucket_decode == TileSizes(
+        tile_m=128, tile_k=3584, tile_n=3072, bucket_base=64
+    )
+    monkeypatch.delenv("TPU_GMM_V6E_PREFILL_TILE_M")
+    monkeypatch.delenv("TPU_GMM_V6E_PREFILL_MAX_BUCKETS")
+    monkeypatch.delenv("TPU_GMM_V6E_DECODE_MAX_BUCKETS")
+
     monkeypatch.setattr(
         "vllm_torchtpu.kernels.megablox.gmm_v2.pltpu.get_tpu_info",
         lambda: SimpleNamespace(
