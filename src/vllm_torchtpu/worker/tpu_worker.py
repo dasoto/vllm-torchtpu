@@ -279,6 +279,12 @@ class TPUWorker(WorkerBase):
                 # torch_tpu's own slice rendezvous, and forcing it here would
                 # collide with that.
                 pc.data_parallel_master_ip = master_addr
+                # `_coord_store_port` binds on the driver host (INDEX=0), which
+                # differs from `master_addr` (`host_order[0]`, slice rank 0)
+                # when hosts are ordered by physical TPU coordinates. Clear it
+                # here so `init_distributed_environment` uses the pre-allocated
+                # `get_next_dp_init_port()` directly against `master_addr`.
+                pc._coord_store_port = 0
                 # Ray hands each engine whichever chips were free, so slice
                 # ranks do not run dp-rank-major and binding.rank is not
                 # `dp_rank * per_engine_world + self.rank`. Pre-subtract the
