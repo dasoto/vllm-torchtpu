@@ -150,3 +150,44 @@ def test_internal_checkpoint_drops_the_last_block_stop_of_a_long_prompt(
     scheduler = _pp4pcp8_scheduler(checkpoint_blocks, drop_eagle_block=False)
 
     assert _schedule_prompt(scheduler, 19456) == chunks
+
+
+@pytest.mark.parametrize("retention_interval", [0, 8192])
+def test_hybrid_dcp_partial_cache_hit_does_not_livelock_when_decodes_consume_budget(
+    retention_interval: int,
+):
+    """Under DCP=16 hybrid Mamba+MLA (block_size=8192, hash_block_size=512,
+    LPTT=8192, max_num_scheduled_tokens=8192), active decodes leave <8192
+    tokens in the step budget; prefill chunks must advance by 512-token Mamba
+    blocks (e.g. 7680) instead of returning 0 and livelocking."""
+    _patch_vllm_mamba_split_scheduler_block_size()
+    physical_cache_config = SimpleNamespace(
+        block_size=512,
+        prefix_cache_retention_interval=retention_interval,
+    )
+    scheduler = SimpleNamespace(
+        cache_config=physical_cache_config,
+        block_size=8192,
+        use_eagle=False,
+        use_eagle_block_drop=False,
+        num_hash_lookahead_tokens=0,
+        max_num_scheduled_tokens=8192,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=8192),
+        mamba_partial_cache_hit=True,
+        mamba_has_prefill_checkpoint_blocks=False,
+        mamba_shared_prefix_checkpoint=True,
+        hash_block_size=512,
+        connector=object(),
+    )
+    req = _request(prompt_len=25000)
+    # 52 active decodes consumed 52 tokens of the 8192 budget -> 8140 left.
+    chunk0 = Scheduler._mamba_block_aligned_split(scheduler, req, num_new_tokens=8140)
+    assert chunk0 == 7680
+    req.num_computed_tokens = chunk0
+    chunk1 = Scheduler._mamba_block_aligned_split(scheduler, req, num_new_tokens=8140)
+    if retention_interval == 0:
+        assert chunk1 == 7680
+    else:
+        assert chunk1 == 512  # stops at super-block 8192 when segment retention > 0
+    assert scheduler.cache_config is physical_cache_config
+    assert scheduler.cache_config.block_size == 512

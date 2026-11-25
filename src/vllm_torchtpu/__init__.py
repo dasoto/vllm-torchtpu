@@ -137,15 +137,19 @@ def _patch_vllm_hybrid_kv_load_failure_recovery() -> None:
 
 
 def _patch_vllm_mamba_split_scheduler_block_size() -> None:
-    """Align Mamba prefill splits to the scheduler block size.
+    """Align Mamba prefill splits to the Mamba manager's logical block size.
 
     vLLM 0.27.0 uses the rank-local physical ``CacheConfig.block_size`` in
     ``Scheduler._mamba_block_aligned_split``.  Under hybrid PCP, prefix hashes
     and reusable Mamba states instead advance at ``Scheduler.block_size``, the
-    logical block spanning all PCP ranks.  Calling the upstream method with a
-    scheduler-local cache-config view backports the corresponding one-line fix
-    without mutating the shared ``VllmConfig.cache_config`` or copying the
-    scheduling algorithm into this plugin.
+    logical block spanning all PCP ranks.  Under hybrid DCP with fine-grained
+    Mamba partial cache hits (``mamba_partial_cache_hit=True``), Mamba states
+    remain unsharded across DCP and advance at ``hash_block_size`` (e.g. 512),
+    whereas ``Scheduler.block_size`` is inflated by ``dcp_world_size`` (e.g.
+    8,192) solely for full-attention blocks; substituting ``Scheduler.block_size``
+    there livelocks chunked prefill whenever ``long_prefill_token_threshold >=
+    Scheduler.block_size`` and active decodes reduce ``token_budget`` below
+    ``Scheduler.block_size``.
     """
     import copy
     from functools import wraps
@@ -159,18 +163,46 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
     @wraps(original_split)
     def split_with_scheduler_block_size(self, *args, **kwargs):
         physical_cache_config = self.cache_config
-        if physical_cache_config.block_size == self.block_size:
-            return original_split(self, *args, **kwargs)
+        target_block_size = self.block_size
+        if getattr(self, "mamba_partial_cache_hit", False):
+            retention = getattr(
+                physical_cache_config, "prefix_cache_retention_interval", None
+            )
+            if retention == 0 or getattr(self, "connector", None) is None:
+                mamba_bs = max(
+                    int(physical_cache_config.block_size or 0),
+                    int(getattr(self, "hash_block_size", 0) or 0),
+                )
+                if 0 < mamba_bs <= self.block_size:
+                    target_block_size = mamba_bs
 
-        scheduler_cache_config = copy.copy(physical_cache_config)
-        scheduler_cache_config.block_size = self.block_size
-        # schedule() calls this method synchronously on the EngineCore thread,
-        # and the upstream implementation contains no callback or await point.
-        self.cache_config = scheduler_cache_config
-        try:
-            return original_split(self, *args, **kwargs)
-        finally:
-            self.cache_config = physical_cache_config
+        if physical_cache_config.block_size == target_block_size:
+            res = original_split(self, *args, **kwargs)
+        else:
+            scheduler_cache_config = copy.copy(physical_cache_config)
+            scheduler_cache_config.block_size = target_block_size
+            # schedule() calls this method synchronously on the EngineCore thread,
+            # and the upstream implementation contains no callback or await point.
+            self.cache_config = scheduler_cache_config
+            try:
+                res = original_split(self, *args, **kwargs)
+            finally:
+                self.cache_config = physical_cache_config
+
+        if res == 0 and getattr(self, "mamba_partial_cache_hit", False):
+            mamba_bs = max(
+                int(physical_cache_config.block_size or 0),
+                int(getattr(self, "hash_block_size", 0) or 0),
+            )
+            if 0 < mamba_bs < target_block_size:
+                fallback_cfg = copy.copy(physical_cache_config)
+                fallback_cfg.block_size = mamba_bs
+                self.cache_config = fallback_cfg
+                try:
+                    res = original_split(self, *args, **kwargs)
+                finally:
+                    self.cache_config = physical_cache_config
+        return res
 
     split_with_scheduler_block_size._tpu_scheduler_block_size_patch = True
     Scheduler._mamba_block_aligned_split = split_with_scheduler_block_size
