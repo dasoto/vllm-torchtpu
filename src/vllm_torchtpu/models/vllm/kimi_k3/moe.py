@@ -38,7 +38,7 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.intra_chip import get_intra_chip_group, get_tp_subgroup
-from vllm_torchtpu.layers.adapter import moe_routing
+from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import (
     IntraChipColumnParallelLinear,
     make_latent_projection,
@@ -51,6 +51,7 @@ from vllm_torchtpu.layers.adapter.quantization.unquantized import VllmUnquantize
 
 from .collective_ops import FusedPrefillCollectives, GenericSPCollectives
 from .layers import KimiMLP
+from .ragged_ep_moe import ragged_ep_moe_supported, run_ragged_ep_moe
 
 if TYPE_CHECKING:
     from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
@@ -479,7 +480,55 @@ class KimiMoE(nn.Module):
                     padding_mask[:, None], torch.zeros_like(weights), weights
                 )
             moe_chunks = getattr(self, "sp_moe_chunks", 1) if sequence_parallel else 1
-            if moe_chunks > 1:
+            use_ragged_sp = sequence_parallel and ragged_ep_moe_supported(method)
+            use_ragged_decode = (
+                not sequence_parallel
+                and envs.TPU_K3_GENERIC_SP_RAGGED_A2A_DECODE
+                and ragged_ep_moe_supported(method)
+                and latent.shape[0] % group.world_size == 0
+            )
+            if use_ragged_sp or use_ragged_decode:
+                if padding_mask is None:
+                    ids, weights = token_padding.zero_routing_weights_for_padding(
+                        ids.to(torch.int32),
+                        weights,
+                        is_local_tensor=sequence_parallel,
+                    )
+                if use_ragged_sp:
+                    if moe_chunks > 1:
+                        l_chunks = latent.reshape(moe_chunks, -1, latent.shape[-1])
+                        w_chunks = weights.reshape(moe_chunks, -1, weights.shape[-1])
+                        i_chunks = ids.reshape(moe_chunks, -1, ids.shape[-1])
+                        output = torch.cat(
+                            [
+                                run_ragged_ep_moe(
+                                    method,
+                                    routed,
+                                    l_chunks[idx],
+                                    w_chunks[idx],
+                                    i_chunks[idx],
+                                )
+                                for idx in range(moe_chunks)
+                            ],
+                            dim=0,
+                        )
+                    else:
+                        output = run_ragged_ep_moe(method, routed, latent, weights, ids)
+                else:
+                    tp_ws = group.world_size
+                    tp_rk = group.rank_in_group
+                    l_shard = latent.reshape(tp_ws, -1, latent.shape[-1])[
+                        tp_rk
+                    ].contiguous()
+                    w_shard = weights.reshape(tp_ws, -1, weights.shape[-1])[
+                        tp_rk
+                    ].contiguous()
+                    i_shard = ids.reshape(tp_ws, -1, ids.shape[-1])[tp_rk].contiguous()
+                    out_shard = run_ragged_ep_moe(
+                        method, routed, l_shard, w_shard, i_shard
+                    )
+                    output = group.all_gather(out_shard, dim=0)
+            elif moe_chunks > 1:
                 latent_chunks = latent.reshape(moe_chunks, -1, latent.shape[-1])
                 weight_chunks = weights.reshape(moe_chunks, -1, weights.shape[-1])
                 id_chunks = ids.reshape(moe_chunks, -1, ids.shape[-1])

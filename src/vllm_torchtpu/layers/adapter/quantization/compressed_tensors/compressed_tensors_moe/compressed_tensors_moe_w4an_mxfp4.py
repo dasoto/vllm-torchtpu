@@ -300,6 +300,21 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         if self._rhs_quant_dtype is not None:
             prebuild_kwargs["rhs_quant_dtype"] = self._rhs_quant_dtype
         prebuild_fused_moe_kernel(**prebuild_kwargs)
+        if use_ep and layer.w13_weight.device.type == "tpu":
+            from vllm_torchtpu.models.vllm.kimi_k3.ragged_ep_moe import (
+                RAGGED_EP_MOE_OP_ATTR,
+                prebuild_ragged_ep_moe,
+            )
+
+            setattr(
+                self,
+                RAGGED_EP_MOE_OP_ATTR,
+                prebuild_ragged_ep_moe(
+                    layer,
+                    activation=activation_str,
+                    rhs_quant_dtype=self._rhs_quant_dtype,
+                ),
+            )
 
     def apply_monolithic(
         self,
