@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     TPU_K3_GENERIC_SP_RAGGED_A2A_DECODE: bool = False
     TPU_K3_GENERIC_SP_RAGGED_A2A_INT8: bool = False
     TPU_K3_GENERIC_SP_RAGGED_A2A_PER_PEER: bool = False
+    TPU_K3_GENERIC_SP_SORTED_EP_GROUP: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
     TPU_DCP_LSE_MERGE_A2A: bool = False
@@ -497,6 +498,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "TPU_K3_GENERIC_SP_RAGGED_A2A_PER_PEER": env_bool(
         "TPU_K3_GENERIC_SP_RAGGED_A2A_PER_PEER", default=False
+    ),
+    "TPU_K3_GENERIC_SP_SORTED_EP_GROUP": env_bool(
+        "TPU_K3_GENERIC_SP_SORTED_EP_GROUP", default=False
     ),
     # DCP sparse MLA (SparseCore cache layout): gather and attend this many
     # top-k slots per token instead of all `topk`; tokens owning more are

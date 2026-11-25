@@ -260,3 +260,34 @@ def test_compute_recv_capacity_decode_vs_prefill():
     assert _compute_recv_capacity(3, 16, 128, 7, 20480) == 256
     assert _compute_recv_capacity(512, 16, 128, 7, 20480) == 20480
     assert _compute_recv_capacity(256, 16, 128, 7, 0) == 10240
+
+
+def test_generic_sp_collectives_sorted_ep_group(monkeypatch):
+    from unittest.mock import MagicMock
+
+    import torch
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.models.vllm.kimi_k3 import collective_ops
+
+    fake_tp = MagicMock()
+    fake_tp.world_size = 32
+    fake_tp.rank_in_group = 0
+    fake_pg = object()
+
+    monkeypatch.setattr(envs, "TPU_K3_GENERIC_SP_SORTED_EP_GROUP", True)
+    monkeypatch.setattr(collective_ops, "get_ep_group", lambda: MagicMock(world_size=128))
+    monkeypatch.setattr(
+        "vllm_torchtpu.distributed.ep_mesh.ep_sorted_gather_group",
+        lambda: (fake_pg, tuple(range(128))),
+    )
+    coll = collective_ops.GenericSPCollectives(fake_tp)
+    grp = coll._moe_gather_group(sequence_parallel=True)
+    assert isinstance(grp, collective_ops._ProcessGroupCollectiveAdapter)
+    assert grp.world_size == 128
+    assert grp.device_group is fake_pg
+    single = collective_ops._ProcessGroupCollectiveAdapter(fake_pg, 1)
+    t = torch.ones((4, 8))
+    assert single.all_gather(t, dim=0) is t
+    assert single.reduce_scatter(t, dim=0) is t
+

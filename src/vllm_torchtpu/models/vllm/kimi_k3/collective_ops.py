@@ -389,13 +389,58 @@ class FusedPrefillCollectives:
         return self.base.all_reduce(x)
 
 
+class _ProcessGroupCollectiveAdapter:
+    """GroupCoordinator-compatible dim-0 all_gather / reduce_scatter over a ProcessGroup."""
+
+    def __init__(self, pg: Any, world_size: int) -> None:
+        self.device_group = pg
+        self.world_size = int(world_size)
+
+    def all_gather(self, x: torch.Tensor, dim: int = 0) -> torch.Tensor:
+        import torch.distributed._functional_collectives as funcol
+
+        if self.world_size <= 1:
+            return x
+        if dim < 0:
+            dim += x.dim()
+        assert dim == 0, f"_ProcessGroupCollectiveAdapter only supports dim=0, got {dim}"
+        out = funcol.all_gather_single(x.contiguous(), 0, self.device_group)
+        if isinstance(out, funcol.AsyncCollectiveTensor):
+            out = out.wait()
+        return out
+
+    def reduce_scatter(self, x: torch.Tensor, dim: int = 0) -> torch.Tensor:
+        import torch.distributed._functional_collectives as funcol
+
+        if self.world_size <= 1:
+            return x
+        if dim < 0:
+            dim += x.dim()
+        assert dim == 0, f"_ProcessGroupCollectiveAdapter only supports dim=0, got {dim}"
+        out = funcol.reduce_scatter_single(x.contiguous(), "sum", 0, self.device_group)
+        if isinstance(out, funcol.AsyncCollectiveTensor):
+            out = out.wait()
+        return out
+
+
 class GenericSPCollectives:
     """Process-group SP collectives for multi-host / DP>=1 Kimi K3 deployments."""
 
     def __init__(self, tp_group=None) -> None:
+        from vllm_torchtpu import envs
+        from vllm_torchtpu.distributed.ep_mesh import ep_sorted_gather_group
+
         self.base = tp_group if tp_group is not None else get_tp_group()
         self.world_size = int(self.base.world_size)
         self.rank_in_group = int(self.base.rank_in_group)
+        self._sorted_ep_group = None
+        if envs.TPU_K3_GENERIC_SP_SORTED_EP_GROUP and get_ep_group() is not None:
+            sorted_ep = ep_sorted_gather_group()
+            if sorted_ep is not None:
+                pg, positions = sorted_ep
+                self._sorted_ep_group = _ProcessGroupCollectiveAdapter(
+                    pg, len(positions)
+                )
 
     def all_gather(self, x: torch.Tensor, dim: int = 0) -> torch.Tensor:
         if self.world_size <= 1:
@@ -414,6 +459,8 @@ class GenericSPCollectives:
 
     def _moe_gather_group(self, *, sequence_parallel: bool):
         if sequence_parallel:
+            if self._sorted_ep_group is not None:
+                return self._sorted_ep_group
             ep = get_ep_group()
             return ep if ep is not None else self.base
         from vllm.distributed.parallel_state import get_dp_group
@@ -458,9 +505,8 @@ class GenericSPCollectives:
         self, output: torch.Tensor, *, sequence_parallel: bool = True
     ) -> torch.Tensor:
         if sequence_parallel:
-            ep = get_ep_group()
-            group = ep if ep is not None else self.base
-            if int(group.world_size) <= 1:
+            group = self._moe_gather_group(sequence_parallel=True)
+            if group is None or int(group.world_size) <= 1:
                 return output
             return group.reduce_scatter(output, dim=0)
         dp_group = self._moe_gather_group(sequence_parallel=False)
