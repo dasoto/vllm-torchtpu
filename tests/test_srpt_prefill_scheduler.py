@@ -1796,4 +1796,18 @@ def test_hold_backoff_scales_with_prefill_schedule_interval(shared_model_config)
     assert scheduled == [set(), {"long"}, {"long"}, {"long"}, {"long"}, set()]
 
 
+def test_cadence_no_escape_admits_waiting_when_no_rank_decoding(shared_model_config):
+    """When zero DP ranks are decoding (`running` empty and `_other_rank_decoding`
+    False), `cadence_no_escape` must not force `K-1` empty dummy steps."""
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        num_blocks=64,
+        max_num_seqs=8,
+        max_num_batched_tokens=64,
+    )
+    scheduler.cadence_no_escape = True
+    scheduler._other_rank_decoding = False
+    scheduler.add_request(_make_real_request("p_idle", 64, hasher, seed=55))
+    out = scheduler.schedule(throttle_prefills=True)
+    assert out.num_scheduled_tokens == {"p_idle": 64}
 

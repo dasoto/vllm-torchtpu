@@ -776,12 +776,13 @@ class SrptPrefillScheduler(AsyncScheduler):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         local_decoding = any(not r.is_prefill_chunk for r in self.running)
+        any_decoding = local_decoding or self._other_rank_decoding
+        if self.cadence_no_escape and not any_decoding:
+            throttle_prefills = False
         # The cap only protects decodes: it applies while this rank decodes in
         # this step or another rank decoded in the last reported step.
-        self._attn_cap_on = bool(self.attn_work_cap) and (
-            self._other_rank_decoding or local_decoding
-        )
-        if self.cadence_no_escape:
+        self._attn_cap_on = bool(self.attn_work_cap) and any_decoding
+        if self.cadence_no_escape and any_decoding:
             self.prefill_capacity_bound = False
         self._maybe_promote_warm_waiting(throttle_prefills=throttle_prefills)
 
@@ -925,7 +926,7 @@ class SrptPrefillScheduler(AsyncScheduler):
         self._in_schedule = True
         try:
             output = super().schedule(throttle_prefills)
-            if self.cadence_no_escape:
+            if self.cadence_no_escape and any_decoding:
                 self.prefill_capacity_bound = False
         finally:
             self._in_schedule = False
