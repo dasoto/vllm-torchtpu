@@ -556,6 +556,38 @@ class TestDPPrefixDirectory(unittest.TestCase):
                 for d in dirs:
                     d.close()
 
+    def test_sticky_7168_prefix_and_large_uncached_followup_stay_on_home_dp(self):
+        directory = _DPPrefixDirectory(num_engines=8, chunk_tokens=512)
+        shared_sys = [1000 + i for i in range(6_656)]
+        for eng in range(8):
+            directory.record(
+                _rolling_chunk_digests(shared_sys, 512),
+                eng,
+                prompt_len=len(shared_sys),
+                now=1.0,
+            )
+        # Session with 7,168 tokens on engine 3 (one 512-token chunk past 6,656 sys prompt)
+        turn0 = shared_sys + [50_000 + i for i in range(512)]
+        directory.record(
+            _rolling_chunk_digests(turn0, 512),
+            3,
+            prompt_len=len(turn0),
+            now=2.0,
+        )
+        # Follow-up adding 80,000 uncached tool-output tokens must still stick to engine 3
+        turn1 = turn0 + [90_000 + i for i in range(80_000)]
+        lb = [(0, 10, 0.2)] * 8
+        lb[3] = (2, 12, 0.3)
+        chosen, _ = directory.select_engine(
+            prompt_token_ids=turn1,
+            lb_engines=lb,
+            inflight_by_idx=[10, 10, 10, 14, 10, 10, 10, 10],
+            client_count=1,
+            eng_start_index=0,
+            now=3.0,
+        )
+        self.assertEqual(chosen, 3)
+
 
 if __name__ == "__main__":
     unittest.main()

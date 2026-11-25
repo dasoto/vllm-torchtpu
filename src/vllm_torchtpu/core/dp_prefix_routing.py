@@ -54,8 +54,8 @@ _MAX_TRACKED_CHUNKS = 262_144
 _RUNNING_TOKEN_WEIGHT = 512.0
 _WAITING_TOKEN_WEIGHT = 4096.0
 _STORAGE_BALANCE_WEIGHT = 6144.0
-_STICKY_LONG_PREFIX_TOKENS = 8_192
-_WARM_FOLLOWUP_MAX_UNCACHED = 65_536
+_STICKY_LONG_PREFIX_TOKENS = 7_168
+_WARM_FOLLOWUP_MAX_UNCACHED = 196_608
 _PREFILL_DRAIN_TOKENS_PER_SEC = 750.0
 
 _SHM_MAGIC = b"TPUDPPR2"
@@ -503,8 +503,10 @@ class _DPPrefixDirectory:
         start_idx: int,
     ) -> int:
         max_cached = max(cached) if cached else 0
+        min_cached = min(cached) if cached else 0
         long_warm_session = (
             max_cached >= _STICKY_LONG_PREFIX_TOKENS
+            and max_cached > min_cached
             and (prompt_len - max_cached) <= _WARM_FOLLOWUP_MAX_UNCACHED
         )
         uncached_scale = float(max(self.num_engines, 1)) if long_warm_session else 1.0
@@ -525,6 +527,7 @@ class _DPPrefixDirectory:
             is_warm_home = (
                 long_warm_session
                 and cached[idx] >= _STICKY_LONG_PREFIX_TOKENS
+                and cached[idx] > min_cached
                 and (prompt_len - cached[idx]) <= _WARM_FOLLOWUP_MAX_UNCACHED
             )
             if is_warm_home:
@@ -539,6 +542,10 @@ class _DPPrefixDirectory:
             )
             if not is_warm_home:
                 load_cost += self._engine_prefill_backlog[idx]
+                if long_warm_session and min_cached > 0:
+                    # Restore full session-affinity margin when a shared system
+                    # prompt (`min_cached > 0`) is warm across all DP engines.
+                    load_cost += float(min_cached) * uncached_scale
             uncached = float(max(0, prompt_len - cached[idx])) * uncached_scale
             storage_ratio = self._engine_counts[idx] / avg_blocks
             cost = (

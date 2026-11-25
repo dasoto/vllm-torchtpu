@@ -84,6 +84,7 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     CanonicalKVCacheTensor,
     GPULoadStoreSpec,
+    LookupResult,
     OffloadKey,
     OffloadPolicy,
 )
@@ -282,10 +283,152 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 self.config.tokens_per_hash,
             )
 
+    def _lookup(
+        self,
+        req_status,
+        max_num_new_tokens: int | None = None,
+    ) -> int | None:
+        hit = super()._lookup(req_status, max_num_new_tokens)
+        if (
+            hit is None
+            or not self.config.supports_partial_tail
+            or self._partial_tail_block_size <= 0
+            or self.config.retention_interval != 0
+            or not self._cow_source_groups
+        ):
+            return hit
+
+        # Under sparse Mamba retention (`prefix_cache_retention_interval == 0`),
+        # Mamba states are only checkpointed and offloaded at turn prompt
+        # boundaries (`boundary % tokens_per_hash == 0`), not at interior
+        # full-attention super-block boundaries (`block_size = 8,192`).
+        # Upstream `_lookup_complete_chunks` intersects full-attention complete
+        # chunks with Mamba complete chunks, collapsing `complete_hit` to 0
+        # whenever no prior turn ended on an exact `block_size` multiple, and
+        # `_lookup` then searches partial tails only within one `block_size`
+        # past `local_tokens + complete_hit`. Scan full-attention complete
+        # chunks directly to establish the valid prefix horizon and search
+        # `tokens_per_hash`-aligned partial-tail boundaries down from there.
+        saved_partial = req_status.partial_tail_boundary
+        local_tokens = req_status.num_locally_computed_tokens
+        block_size = self._partial_tail_block_size
+        tokens_per_hash = self.config.tokens_per_hash
+        if local_tokens % block_size != 0:
+            return hit
+
+        best_boundary = local_tokens + hit
+        max_boundary = req_status.req.num_prompt_tokens - 1
+        if self._max_eagle_proof_margin:
+            max_boundary = min(
+                max_boundary,
+                len(req_status.req.block_hashes) * tokens_per_hash
+                - self._max_eagle_proof_margin,
+            )
+        if max_num_new_tokens is not None:
+            max_boundary = min(max_boundary, local_tokens + max_num_new_tokens)
+        if req_status.max_load_tokens is not None:
+            max_boundary = min(
+                max_boundary, local_tokens + req_status.max_load_tokens
+            )
+        max_boundary = (max_boundary // tokens_per_hash) * tokens_per_hash
+        if max_boundary <= best_boundary:
+            return hit
+
+        fa_pairs = [
+            (group_config, group_state)
+            for group_config, group_state in zip(
+                self.config.kv_group_configs, req_status.group_states
+            )
+            if not group_config.requires_cow_source
+            and group_config.sliding_window_size_in_chunks is None
+        ]
+        if not fa_pairs or any(
+            gc.tokens_per_chunk != block_size for gc, _ in fa_pairs
+        ):
+            return hit
+
+        start_chunk = local_tokens // block_size
+        max_fa_chunks = min(
+            max_boundary // block_size,
+            min(len(gs.offload_keys) for _, gs in fa_pairs),
+        )
+        chunks_being_loaded = self._chunks_being_loaded or ()
+        fa_confirmed_end = start_chunk
+        fa_chunk_pending: dict[int, bool] = {}
+        any_pending = False
+        for chunk_idx in range(start_chunk, max_fa_chunks):
+            chunk_miss = False
+            chunk_pend = False
+            for _, gs in fa_pairs:
+                key = gs.offload_keys[chunk_idx]
+                res = self.manager.lookup(key, req_status.req_context)
+                if res is LookupResult.MISS:
+                    chunk_miss = True
+                    break
+                chunk_pend |= (res is not LookupResult.HIT) or (
+                    key in chunks_being_loaded
+                )
+            if chunk_miss:
+                break
+            fa_chunk_pending[chunk_idx] = chunk_pend
+            any_pending |= chunk_pend
+            fa_confirmed_end = chunk_idx + 1
+
+        search_hi = min(
+            max_boundary,
+            (fa_confirmed_end + 1) * block_size - tokens_per_hash,
+        )
+        if search_hi <= best_boundary:
+            if any_pending and hit == 0:
+                req_status.partial_tail_boundary = None
+                return None
+            return hit
+
+        for boundary in range(search_hi, best_boundary, -tokens_per_hash):
+            if boundary % block_size == 0:
+                continue
+            needed_fa_end = boundary // block_size
+            if needed_fa_end > fa_confirmed_end:
+                continue
+            bridge_pending = any(
+                fa_chunk_pending.get(c, False)
+                for c in range(start_chunk, needed_fa_end)
+            )
+            if chunks_being_loaded and not bridge_pending:
+                for gc in self.config.kv_group_configs:
+                    kt = self._partial_tail_key_tokens(gc, boundary)
+                    pkey = self._make_boundary_key(
+                        req_status.req, gc.group_idx, kt, req_status.req_context
+                    )
+                    if pkey in chunks_being_loaded:
+                        bridge_pending = True
+                        break
+            pt_hit, pt_pending = self._lookup_partial_tail(
+                req_status, boundary, bridge_pending
+            )
+            if pt_hit:
+                for gc, gs in fa_pairs:
+                    rec_from = max(start_chunk, gs.lookup_hit_end_chunk_idx)
+                    for c in range(rec_from, needed_fa_end):
+                        self._events_tracker.record_lookup(
+                            req_status.req, gc, c, gs.offload_keys[c]
+                        )
+                req_status.partial_tail_boundary = boundary
+                return boundary - local_tokens
+            any_pending |= pt_pending
+
+        req_status.partial_tail_boundary = saved_partial
+        if any_pending and hit == 0:
+            req_status.partial_tail_boundary = None
+            return None
+        return hit
+
     def update_state_after_alloc(
         self, request, blocks, num_external_tokens: int
     ) -> None:
         req_status = self._req_status.get(request.request_id)
+        if num_external_tokens == 0 and req_status is not None:
+            req_status.partial_tail_boundary = None
         had_partial_tail = (
             num_external_tokens > 0
             and req_status is not None

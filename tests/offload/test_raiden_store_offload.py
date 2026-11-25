@@ -4677,6 +4677,90 @@ class TestDcpPartialTailRecall(unittest.TestCase):
             },
         )
 
+    def test_sparse_retention_zero_recalls_partial_tail_without_interior_mamba_chunks(
+        self,
+    ):
+        from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+        from vllm.v1.core.kv_cache_utils import KVCacheBlock
+
+        self.scheduler.config = self.scheduler.config._replace(retention_interval=0)
+
+        # Under prefix_cache_retention_interval == 0, full-attention stores all
+        # complete super-block chunks (13,312 and 26,624) plus the partial tail
+        # (31,616), whereas Mamba ONLY checkpoints and stores the prompt tail
+        # (31,616) — NOT interior super-block boundaries 13,312 or 26,624.
+        for boundary in (self.DCP_BLOCK, 2 * self.DCP_BLOCK, self.tail_boundary):
+            seed_host_entries(self.store, self._hash_key(self.ATTN, boundary))
+        seed_host_entries(self.store, self._hash_key(self.MAMBA, self.tail_boundary))
+
+        hit, load_async = self.scheduler.get_num_new_matched_tokens(self.request, 0)
+        self.assertEqual(hit, self.tail_boundary)
+        self.assertTrue(load_async)
+
+        attn_blocks = [KVCacheBlock(101), KVCacheBlock(102), KVCacheBlock(103)]
+        mamba_blocks = [KVCacheBlock(0) for _ in range(18)] + [KVCacheBlock(203)]
+        for blk in mamba_blocks[:-1]:
+            blk.is_null = True
+        self.scheduler.update_state_after_alloc(
+            self.request,
+            KVCacheBlocks(blocks=(attn_blocks, mamba_blocks)),
+            self.tail_boundary,
+        )
+        (job,) = self.scheduler._current_batch_load_jobs.values()
+        self.assertEqual(list(job.dst_spec.block_ids), [101, 102, 103, 203])
+        (status,) = self.scheduler._jobs.values()
+        self.assertEqual(
+            status.keys,
+            {
+                self._hash_key(self.ATTN, self.DCP_BLOCK),
+                self._hash_key(self.ATTN, 2 * self.DCP_BLOCK),
+                self._hash_key(self.ATTN, self.tail_boundary),
+                self._hash_key(self.MAMBA, self.tail_boundary),
+            },
+        )
+        req_status = self.scheduler._req_status[self.request.request_id]
+        self.assertEqual(req_status.group_states[self.ATTN].next_stored_chunk_idx, 2)
+
+        # While the first request's chunks are in `_chunks_being_loaded`, a
+        # concurrent lookup for the same prefix defers cleanly (`None`).
+        from vllm.sampling_params import SamplingParams
+        from vllm.utils.hashing import sha256
+        from vllm.v1.core.kv_cache_utils import get_request_block_hasher
+        from vllm.v1.request import Request
+
+        self.scheduler._release_step()
+        params2 = SamplingParams(max_tokens=1)
+        params2.update_from_generation_config({}, 2)
+        req2 = Request(
+            "req_dcp_local_supersede",
+            list(range(self.prompt_len)),
+            params2,
+            None,
+            block_hasher=get_request_block_hasher(self.HASH_BLOCK, sha256),
+        )
+        self.scheduler.on_new_request(req2)
+        deferred_hit, _ = self.scheduler.get_num_new_matched_tokens(
+            req2, self.DCP_BLOCK
+        )
+        self.assertIsNone(deferred_hit)
+        self.scheduler._release_step()
+
+        # Once the in-flight load finishes (`_chunks_being_loaded` cleared), a
+        # local hit that supersedes the external partial tail (`num_external_tokens=0`)
+        # clears stale `partial_tail_boundary` in `update_state_after_alloc`.
+        self.scheduler._chunks_being_loaded.clear()
+        hit2, _ = self.scheduler.get_num_new_matched_tokens(req2, self.DCP_BLOCK)
+        self.assertEqual(hit2, self.tail_boundary - self.DCP_BLOCK)
+        req_status2 = self.scheduler._req_status[req2.request_id]
+        self.assertEqual(req_status2.partial_tail_boundary, self.tail_boundary)
+        self.scheduler.update_state_after_alloc(
+            req2,
+            KVCacheBlocks(blocks=(attn_blocks, mamba_blocks)),
+            0,
+        )
+        self.assertIsNone(req_status2.partial_tail_boundary)
+        self.scheduler._release_step()
+
 
 if __name__ == "__main__":
     unittest.main()

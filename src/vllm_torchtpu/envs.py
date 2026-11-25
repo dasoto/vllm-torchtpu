@@ -229,6 +229,7 @@ if TYPE_CHECKING:
     VLLM_TPU_PREFILL_CADENCE_NO_ESCAPE: bool = False
     VLLM_TPU_SRPT_PROMOTE_WARM_WAITING: bool = False
     VLLM_TPU_SRPT_SESSION_PRIORITY: bool = False
+    VLLM_TPU_SRPT_MAX_PRESTAGED_KV_HOLDING: int = 2
     VLLM_TPU_SHARED_PREFIX_CHECKPOINT: bool = False
     VLLM_TPU_MOE_EP_MAX_ROUTES: int = 0
     VLLM_TPU_MEGAKERNEL: str = ""
@@ -1405,6 +1406,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # while ordering >=32K cold Turn-0 buckets FCFS within [32K, 128K) and >=128K.
     "VLLM_TPU_SRPT_SESSION_PRIORITY": env_bool(
         "VLLM_TPU_SRPT_SESSION_PRIORITY", default=False
+    ),
+    # SrptPrefillScheduler: maximum concurrent 0-compute external KV loads
+    # pre-staged in kv_holding_waiting per engine.
+    "VLLM_TPU_SRPT_MAX_PRESTAGED_KV_HOLDING": env_nonnegative_int(
+        "VLLM_TPU_SRPT_MAX_PRESTAGED_KV_HOLDING", 2
     ),
     # SrptPrefillScheduler: automatically detect and checkpoint sub-super-block
     # shared prompt prefixes (e.g. shared system prompts under hybrid Mamba + DCP)

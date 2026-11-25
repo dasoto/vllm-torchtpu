@@ -125,6 +125,9 @@ class SrptPrefillScheduler(AsyncScheduler):
         self.cadence_no_escape = envs.VLLM_TPU_PREFILL_CADENCE_NO_ESCAPE
         self.promote_warm_waiting = envs.VLLM_TPU_SRPT_PROMOTE_WARM_WAITING
         self.session_priority = envs.VLLM_TPU_SRPT_SESSION_PRIORITY
+        self.max_prestaged_kv_holding = max(
+            int(envs.VLLM_TPU_SRPT_MAX_PRESTAGED_KV_HOLDING), 1
+        )
         coordinator = getattr(self.kv_cache_manager, "coordinator", None)
         self.shared_prefix_checkpoint_enabled = bool(
             envs.VLLM_TPU_SHARED_PREFIX_CHECKPOINT
@@ -821,7 +824,7 @@ class SrptPrefillScheduler(AsyncScheduler):
             # `cross_rank_decode_hold` steps, also stash non-async prefill
             # requests so `self.waiting` only initiates 0-compute async KV loads.
             allowed_new_async = max(
-                0, _MAX_PRESTAGED_KV_HOLDING - len(self.kv_holding_waiting)
+                0, self.max_prestaged_kv_holding - len(self.kv_holding_waiting)
             )
             seen_async = 0
             kept_waiting: list[Request] = []
@@ -876,7 +879,7 @@ class SrptPrefillScheduler(AsyncScheduler):
             for req_keep in reversed(keep_kv_holding):
                 self.kv_holding_waiting.prepend_request(req_keep)
             if (
-                total_prestaged >= _MAX_PRESTAGED_KV_HOLDING
+                total_prestaged >= self.max_prestaged_kv_holding
                 and prev_pause_state == PauseState.UNPAUSED
             ):
                 self._pause_state = PauseState.PAUSED_NEW
