@@ -1154,6 +1154,26 @@ def test_mla_forward_without_qrep_still_gathers(monkeypatch):
     assert fused_calls[0][1].shape[1] == local_heads
     assert fused_calls[0][2] == layer.kv_lora_rank
 
+    # Negative control: TPU_SPARSE_MLA_DCP_FUSED_Q_MAX_TOKENS caps fused Q gather
+    # on backbone prefill buckets while preserving fused gather below the cap.
+    capped_unfused = []
+    monkeypatch.setenv("TPU_SPARSE_MLA_DCP_FUSED_Q_MAX_TOKENS", "1")
+    monkeypatch.setattr(
+        attention_adapter.vllm_compilation_backends, "model_tag", "backbone"
+    )
+    monkeypatch.setattr(
+        attention_adapter,
+        "all_gather_heads",
+        lambda t, **_kw: (capped_unfused.append(t), t.repeat(1, dcp_size, 1))[1],
+    )
+    impl.forward(
+        layer=layer,
+        **inputs,
+        topk_indices=torch.zeros((num_tokens, 8), dtype=torch.int32),
+    )
+    assert len(capped_unfused) == 2
+    monkeypatch.delenv("TPU_SPARSE_MLA_DCP_FUSED_Q_MAX_TOKENS")
+
     # Negative control: disabling TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER falls back
     # to two separate all_gather_heads calls.
     unfused_calls = []

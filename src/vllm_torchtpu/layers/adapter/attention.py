@@ -16,6 +16,7 @@ import dataclasses
 import functools
 import inspect
 import math
+import os
 from collections.abc import Callable
 from typing import Any, ClassVar, cast
 
@@ -2819,10 +2820,22 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 # KV shard, and the head axis is scattered back after the
                 # merge. Under qrep the group's heads are already local, so
                 # the gather is the identity and is skipped outright.
+                fused_q_max_tokens = int(
+                    os.environ.get("TPU_SPARSE_MLA_DCP_FUSED_Q_MAX_TOKENS", "0")
+                    or "0"
+                )
+                is_backbone_graph = (
+                    vllm_compilation_backends.model_tag == "backbone"
+                )
                 if use_qrep:
                     ql_nope_dcp, q_pe_dcp = ql_nope_flat, q_pe_flat
                 elif (
                     envs.TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER
+                    and (
+                        fused_q_max_tokens <= 0
+                        or not is_backbone_graph
+                        or ql_nope_flat.shape[0] <= fused_q_max_tokens
+                    )
                     and ql_nope_flat.dtype == q_pe_flat.dtype
                     and all_gather_heads is _cp_mla_attention.all_gather_heads
                 ):
