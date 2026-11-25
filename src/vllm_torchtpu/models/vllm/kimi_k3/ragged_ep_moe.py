@@ -23,6 +23,7 @@ import jax
 import jax.numpy as jnp
 import torch
 from jax.sharding import PartitionSpec as P
+from torch_tpu._internal.pallas import jax_op
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.ep_mesh import (
@@ -31,7 +32,6 @@ from vllm_torchtpu.distributed.ep_mesh import (
     ep_mesh_index,
     ep_rank_order,
 )
-from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.kernels.fused_moe.v2.layer import _relabel_expert_ids_to_mesh_order
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
@@ -468,12 +468,12 @@ def prebuild_ragged_ep_moe(
         if not _OPS
         else f"pallas::kimi_ragged_ep_moe_{len(_OPS)}"
     )
-    op = sharded_jax_op(
+    op = jax_op(
         op_name,
         _spmd_moe,
         mesh=mesh,
         input_partition_specs=in_specs,
-        output_partition_specs=out_spec,
+        output_partition_specs=(out_spec,),
     )
     op.register_fake(lambda latent, *_args: torch.empty_like(latent))
     _OPS[key] = op
