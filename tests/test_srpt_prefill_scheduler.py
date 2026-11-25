@@ -1666,3 +1666,134 @@ def test_shared_prefix_checkpoint_pins_hybrid_dcp_system_prompt(
     )
 
 
+def test_session_priority_budget_sharing_co_schedules_held_chunk_with_short_arrivals(
+    shared_model_config, monkeypatch
+):
+    """Under session_priority=True, holding a cold running prefill for short (<8K)
+    arrivals must cap the cold chunk to the block-aligned remaining step budget
+    instead of leaving the prefill step mostly empty."""
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(envs, "VLLM_TPU_SRPT_SESSION_PRIORITY", True)
+    monkeypatch.setattr(envs, "VLLM_TPU_SRPT_PROMOTE_WARM_WAITING", True)
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        num_blocks=64,
+        max_num_seqs=8,
+        max_num_batched_tokens=4 * BLOCK_SIZE,  # 64 tokens
+        long_prefill_token_threshold=4 * BLOCK_SIZE,
+    )
+    assert scheduler.session_priority is True
+
+    # Start a 256-token cold prefill (`64` computed, `192` remaining).
+    req_long = _running_long_prefill(scheduler, hasher, num_tokens=16 * BLOCK_SIZE)
+    assert req_long.num_computed_tokens == 4 * BLOCK_SIZE
+
+    # Two short arrivals (`16` and `16` tokens = `32` tokens total) leave
+    # `64 - 32 = 32` (`2 * BLOCK_SIZE`) aligned tokens of budget for `req_long`!
+    scheduler.add_request(_make_real_request("short_a", BLOCK_SIZE, hasher, seed=21))
+    scheduler.add_request(_make_real_request("short_b", BLOCK_SIZE, hasher, seed=22))
+
+    out = scheduler.schedule(throttle_prefills=False)
+    assert out.num_scheduled_tokens == {
+        "long": 2 * BLOCK_SIZE,
+        "short_a": BLOCK_SIZE,
+        "short_b": BLOCK_SIZE,
+    }
+    assert scheduler._stalled_steps.get("long", 0) == 0
+
+
+def test_unfitting_polled_kv_holding_waiting_stashed_without_blocking_fitting_waiting(
+    shared_model_config, monkeypatch
+):
+    """An already-polled kv_holding_waiting request whose tail blocks temporarily
+    exceed free HBM must be stepped past on a prefill step so fitting requests
+    in self.waiting can still drain, then restored to kv_holding_waiting."""
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(envs, "VLLM_TPU_SRPT_PROMOTE_WARM_WAITING", True)
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        num_blocks=12,  # 11 usable blocks
+        max_num_seqs=8,
+        max_num_batched_tokens=2 * BLOCK_SIZE,
+        long_prefill_token_threshold=BLOCK_SIZE,
+        scheduler_reserve_full_isl=True,
+    )
+    stub_conn = SimpleNamespace(
+        connector_scheduler=SimpleNamespace(
+            config=SimpleNamespace(
+                supports_partial_tail=True,
+                tokens_per_hash=BLOCK_SIZE,
+                alignment_tokens=BLOCK_SIZE,
+            )
+        ),
+        supports_divergent_local_hybrid_hits=False,
+        requires_kv_delivery=False,
+        on_new_request=lambda req: None,
+        get_num_new_matched_tokens=lambda req, n: (0, False),
+        update_state_after_alloc=lambda req, blocks, n: None,
+        build_connector_meta=lambda out: None,
+        request_finished=lambda req, block_ids: (False, None),
+        has_connector_metadata=lambda: False,
+        has_pending_block_frees=lambda: False,
+        has_pending_push_work=lambda: False,
+        reset_cache=lambda: True,
+        get_loaded_kv_cache_group_ids=lambda req: (),
+        get_external_cache_hit_sources=lambda req, n: {},
+    )
+    scheduler.connector = stub_conn
+
+    # Put one decoding request in running so watermark applies.
+    dec = _make_real_request("dec_active", BLOCK_SIZE, hasher, seed=31)
+    scheduler.add_request(dec)
+    scheduler.schedule()
+
+    # Create an already-polled (`status == WAITING`, `num_computed_tokens > 0`)
+    # request in kv_holding_waiting that needs 3 more blocks (`2` computed -> `5` total).
+    polled_kh = _make_real_request("polled_kh", 5 * BLOCK_SIZE, hasher, seed=32)
+    scheduler.requests["polled_kh"] = polled_kh
+    scheduler.kv_cache_manager.allocate_slots(
+        polled_kh, 2 * BLOCK_SIZE, delay_cache_blocks=True
+    )
+    polled_kh.num_computed_tokens = 2 * BLOCK_SIZE
+    polled_kh.status = RequestStatus.WAITING
+    scheduler.kv_holding_waiting.add_request(polled_kh)
+
+    # Pin blocks so only 2 free blocks remain: `polled_kh` needs 3 > 2 (cannot fit),
+    # while `tiny_wait` in self.waiting needs only 1 block (fits!).
+    pool = scheduler.kv_cache_manager.block_pool
+    pin_cnt = pool.get_num_free_blocks() - 2
+    if pin_cnt > 0:
+        pin_req = _make_real_request("pin_pad", pin_cnt * BLOCK_SIZE, hasher, seed=33)
+        scheduler.kv_cache_manager.allocate_slots(pin_req, pin_cnt * BLOCK_SIZE)
+    assert pool.get_num_free_blocks() == 2
+
+    tiny_wait = _make_real_request("tiny_wait", BLOCK_SIZE, hasher, seed=34)
+    scheduler.add_request(tiny_wait)
+
+    out = scheduler.schedule(throttle_prefills=False)
+    assert "tiny_wait" in out.num_scheduled_tokens
+    assert "polled_kh" not in out.num_scheduled_tokens
+    assert [r.request_id for r in scheduler.kv_holding_waiting] == ["polled_kh"]
+
+
+def test_hold_backoff_scales_with_prefill_schedule_interval(shared_model_config):
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        max_num_seqs=4,
+        max_num_batched_tokens=16,
+    )
+    scheduler.scheduler_config.prefill_schedule_interval = 4
+    _running_long_prefill(scheduler, hasher, num_tokens=160)
+    req_stuck = _make_real_request("stuck_cadence", 16, hasher, seed=41)
+    req_stuck.num_stale_output_tokens = 1
+    req_stuck.drop_stale_output = False
+    scheduler.add_request(req_stuck)
+
+    # First failed hold backs off for `1 * prefill_schedule_interval = 4` steps!
+    scheduled = [set(scheduler.schedule().num_scheduled_tokens) for _ in range(6)]
+    assert scheduled == [set(), {"long"}, {"long"}, {"long"}, {"long"}, set()]
+
+
+

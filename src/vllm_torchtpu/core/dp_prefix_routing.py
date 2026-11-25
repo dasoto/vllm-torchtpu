@@ -50,7 +50,7 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 _DEFAULT_CHUNK_TOKENS = 512
-_MAX_TRACKED_CHUNKS = 262_144
+_MAX_TRACKED_CHUNKS = 524_288
 _RUNNING_TOKEN_WEIGHT = 512.0
 _WAITING_TOKEN_WEIGHT = 4096.0
 _STORAGE_BALANCE_WEIGHT = 6144.0

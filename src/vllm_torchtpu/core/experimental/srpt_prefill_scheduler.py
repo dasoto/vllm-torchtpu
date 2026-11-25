@@ -97,7 +97,7 @@ _WARM_HOLD_HEAD_SECONDS = 90.0
 _CRITICAL_HOLD_SECONDS = 240.0
 _WARM_FOLLOWUP_MIN_HIT_TOKENS = 8192
 _WARM_FOLLOWUP_MAX_UNCACHED_TOKENS = 32768
-_MAX_EXTERNAL_BLOCK_HASHES = 65536
+_MAX_EXTERNAL_BLOCK_HASHES = 524288
 _MAX_PRESTAGED_KV_HOLDING = 2
 _MAX_RECENT_PROMPT_PREFIXES = 128
 _MAX_PINNED_JUNCTIONS = 4
@@ -156,6 +156,7 @@ class SrptPrefillScheduler(AsyncScheduler):
         # this step's Scheduler.schedule(), and the requests the cap shrank.
         self._in_schedule = False
         self._cross_rank_decode_hold_active = False
+        self._running_chunk_caps: dict[str, int] = {}
         self._attn_work = 0.0
         self._attn_prefill_scheduled = False
         self._attn_capped: set[str] = set()
@@ -251,7 +252,7 @@ class SrptPrefillScheduler(AsyncScheduler):
         check_full_isl = self.scheduler_reserve_full_isl or (
             self.connector is not None
             and self.promote_warm_waiting
-            and reserved_async_blocks > 0
+            and (is_async_ext or reserved_async_blocks > 0)
         )
         if not check_full_isl and not is_async_ext and self.connector is None:
             return True, local_hit, est_hit
@@ -799,6 +800,7 @@ class SrptPrefillScheduler(AsyncScheduler):
             and self._other_rank_decoding
         )
         self._cross_rank_decode_hold_active = False
+        self._running_chunk_caps.clear()
         if cross_rank_decode_hold:
             held = [r for r in self.running if r.is_prefill_chunk]
             if self.connector is None:
@@ -815,6 +817,31 @@ class SrptPrefillScheduler(AsyncScheduler):
             self._order_running()
             prefilling = [r for r in self.running if r.is_prefill_chunk]
             held, target = self._select_chunks_to_hold()
+            if (
+                self.connector is not None
+                and self.promote_warm_waiting
+                and self.kv_holding_waiting
+            ):
+                # Temporarily step past already-polled kv_holding_waiting entries
+                # whose tail blocks cannot currently fit in free HBM so upstream
+                # allocate_slots() does not return None -> `break` and block
+                # smaller fitting warm/short requests behind them.
+                free_kh = self.kv_cache_manager.block_pool.get_num_free_blocks()
+                now_kh = time.time()
+                keep_kh_ready: list[Request] = []
+                while self.kv_holding_waiting:
+                    req_kh = self.kv_holding_waiting.pop_request()
+                    if (
+                        req_kh.status == RequestStatus.WAITING
+                        and 0 < req_kh.num_computed_tokens < req_kh.num_tokens - 1
+                        and not self._kv_holding_req_fits(req_kh, free_kh)
+                        and (now_kh - req_kh.arrival_time) <= _HARD_STARVATION_SECONDS
+                    ):
+                        stashed_kv_holding.append(req_kh)
+                    else:
+                        keep_kh_ready.append(req_kh)
+                for req_keep_r in reversed(keep_kh_ready):
+                    self.kv_holding_waiting.prepend_request(req_keep_r)
 
         if self.connector is not None and self.waiting:
             # Bound concurrent pre-staged external async loads in kv_holding_waiting
@@ -894,6 +921,7 @@ class SrptPrefillScheduler(AsyncScheduler):
         prev_sched_seq = getattr(self, "sched_step_seq", 0)
         if self.shared_prefix_checkpoint_enabled and not cross_rank_decode_hold:
             self._stage_ready_fa_junctions(prev_sched_seq)
+        capped_by_share = set(self._running_chunk_caps)
         self._in_schedule = True
         try:
             output = super().schedule(throttle_prefills)
@@ -902,6 +930,7 @@ class SrptPrefillScheduler(AsyncScheduler):
         finally:
             self._in_schedule = False
             self._cross_rank_decode_hold_active = False
+            self._running_chunk_caps.clear()
             self._pause_state = prev_pause_state
             self.max_num_scheduled_tokens = prev_max_scheduled
             self.max_num_running_reqs += len(held)
@@ -949,8 +978,14 @@ class SrptPrefillScheduler(AsyncScheduler):
             n = output.num_scheduled_tokens.get(r.request_id, 0)
             if (
                 n >= progress_tokens
-                # Got all the attention work cap allowed this step.
-                or (n > 0 and r.request_id in self._attn_capped)
+                # Got all the attention work cap or budget-sharing cap allowed.
+                or (
+                    n > 0
+                    and (
+                        r.request_id in self._attn_capped
+                        or r.request_id in capped_by_share
+                    )
+                )
                 or not r.is_prefill_chunk
             ):
                 self._stalled_steps.pop(r.request_id, None)
@@ -1051,6 +1086,24 @@ class SrptPrefillScheduler(AsyncScheduler):
         """Tokens from ``context`` to the next multiple of the attention tile."""
         return self.attn_tile_tokens - context % self.attn_tile_tokens
 
+    def _mamba_block_aligned_split(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        num_new_local_computed_tokens: int = 0,
+        num_external_computed_tokens: int = 0,
+    ) -> int:
+        if self._in_schedule and self._running_chunk_caps:
+            cap = self._running_chunk_caps.get(request.request_id)
+            if cap is not None and cap < num_new_tokens:
+                num_new_tokens = cap
+        return super()._mamba_block_aligned_split(
+            request,
+            num_new_tokens,
+            num_new_local_computed_tokens,
+            num_external_computed_tokens,
+        )
+
     def _reserve_prefill_lookahead(
         self, request: Request, num_computed_tokens: int, num_new_tokens: int
     ) -> int:
@@ -1058,6 +1111,10 @@ class SrptPrefillScheduler(AsyncScheduler):
         # schedule, in both queues, after its token budget limits, so it is
         # where the step's attention work is tracked and capped.
         if self._in_schedule:
+            if self._running_chunk_caps:
+                cap = self._running_chunk_caps.get(request.request_id)
+                if cap is not None and cap < num_new_tokens:
+                    num_new_tokens = cap
             if (
                 self._cross_rank_decode_hold_active
                 and num_computed_tokens < request.num_tokens - 1
@@ -1145,7 +1202,10 @@ class SrptPrefillScheduler(AsyncScheduler):
             self._hold_backoff.pop(target.request_id, None)
             return
         failures = self._hold_backoff.get(target.request_id, (0, 0))[0] + 1
-        delay = 1 << min(failures - 1, _MAX_BACKOFF_SHIFT)
+        interval = max(
+            1, int(getattr(self.scheduler_config, "prefill_schedule_interval", 1) or 1)
+        )
+        delay = (1 << min(failures - 1, _MAX_BACKOFF_SHIFT)) * interval
         self._hold_backoff[target.request_id] = (
             failures,
             self.current_step + 1 + delay,
@@ -1233,10 +1293,12 @@ class SrptPrefillScheduler(AsyncScheduler):
 
     def _next_waiting(self) -> Request | None:
         """The request upstream's WAITING pass admits for token compute next."""
-        for r in self.kv_holding_waiting:
-            if self._is_ready_waiting_request(r):
-                return r
         free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        for r in self.kv_holding_waiting:
+            if self._is_ready_waiting_request(r) and self._kv_holding_req_fits(
+                r, free_blocks
+            ):
+                return r
         reserved_async_blocks = (
             self._inflight_prefill_reserved_blocks() + self._spec_decode_step_blocks
         )
@@ -1354,7 +1416,130 @@ class SrptPrefillScheduler(AsyncScheduler):
             kept, alloc, target, hit_blocks, hit_tokens, kv_admit_tokens
         ):
             return [], None
+        if self.session_priority and not self._attn_cap_on and target_remaining < 8192:
+            self._share_remaining_budget_with_held(
+                kept=kept,
+                held=held,
+                alloc=alloc,
+                left=left,
+                lptt=lptt,
+                target=target,
+                target_need=need,
+                hit_blocks=hit_blocks,
+                hit_tokens=hit_tokens,
+                kv_admit_tokens=kv_admit_tokens,
+            )
         return held, target
+
+    def _share_remaining_budget_with_held(
+        self,
+        *,
+        kept: list[Request],
+        held: list[Request],
+        alloc: dict[str, int],
+        left: int,
+        lptt: int,
+        target: Request,
+        target_need: int,
+        hit_blocks: KVCacheBlocks,
+        hit_tokens: int,
+        kv_admit_tokens: int,
+    ) -> None:
+        """Let held running prefill chunks fill unused step budget past short admissions."""
+        align_unit = max(
+            int(getattr(self, "hash_block_size", 0) or self.cache_config.block_size or 1),
+            1,
+        )
+        free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        reserved_async_blocks = (
+            self._inflight_prefill_reserved_blocks() + self._spec_decode_step_blocks
+        )
+        short_reserve = target_need
+        seen_target = False
+        extra_slots = 0
+        max_extra = max(
+            0,
+            self.max_num_active_reqs
+            - (len(kept) + 1 + self.num_waiting_for_streaming_input),
+        )
+        if max_extra > 0:
+            for req_q in chain(self.kv_holding_waiting, self.waiting):
+                if not seen_target:
+                    if req_q.request_id == target.request_id:
+                        seen_target = True
+                    continue
+                if extra_slots >= max_extra or short_reserve >= left:
+                    break
+                if not self._is_ready_waiting_request(req_q):
+                    continue
+                if req_q.num_computed_tokens > 0:
+                    if not self._kv_holding_req_fits(req_q, free_blocks):
+                        break
+                    rem_q = max(req_q.num_tokens - req_q.num_computed_tokens, 1)
+                else:
+                    fits_q, loc_q, est_q = self._waiting_req_fits_kv(
+                        req_q, free_blocks, reserved_async_blocks
+                    )
+                    if self.connector is not None and est_q > loc_q:
+                        if not fits_q:
+                            break
+                        continue
+                    if not fits_q:
+                        if (
+                            self.promote_warm_waiting
+                            and self._inflight_prefills
+                            and req_q.status == RequestStatus.WAITING
+                            and req_q.num_preemptions == 0
+                        ):
+                            continue
+                        break
+                    rem_q = max(req_q.num_tokens - est_q, 1)
+                if rem_q >= 8192:
+                    break
+                need_q = min(rem_q, lptt) if lptt > 0 else rem_q
+                if short_reserve + need_q > left:
+                    break
+                short_reserve += need_q
+                extra_slots += 1
+
+        slack = left - short_reserve
+        while (
+            held
+            and slack >= align_unit
+            and len(kept) + 1 + self.num_waiting_for_streaming_input
+            < self.max_num_active_reqs
+        ):
+            r_share = held[-1]
+            raw_cap = min(self._remaining(r_share), slack)
+            if lptt > 0:
+                raw_cap = min(raw_cap, lptt)
+            aligned_end = (
+                (r_share.num_computed_tokens + raw_cap) // align_unit
+            ) * align_unit
+            share_tokens = aligned_end - r_share.num_computed_tokens
+            if self.need_mamba_block_aligned_split and share_tokens > 0:
+                share_tokens = super()._mamba_block_aligned_split(r_share, share_tokens)
+            share_tokens = super()._reserve_prefill_lookahead(
+                r_share, r_share.num_computed_tokens, share_tokens
+            )
+            if share_tokens < align_unit:
+                break
+            trial_kept = kept + [r_share]
+            trial_alloc = {**alloc, r_share.request_id: share_tokens}
+            if not self._kv_fits_hold(
+                trial_kept,
+                trial_alloc,
+                target,
+                hit_blocks,
+                hit_tokens,
+                kv_admit_tokens,
+            ):
+                break
+            held.pop()
+            kept.append(r_share)
+            alloc[r_share.request_id] = share_tokens
+            self._running_chunk_caps[r_share.request_id] = share_tokens
+            slack -= share_tokens
 
     def _kv_fits_hold(
         self,
