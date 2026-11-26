@@ -40,3 +40,26 @@ def optimization_barrier_op() -> Any:
 def optimization_barrier(x: torch.Tensor) -> torch.Tensor:
     """Block XLA fusion passes from fusing across ``x``."""
     return optimization_barrier_op()(x)
+
+
+@run_once
+def pair_optimization_barrier_op() -> Any:
+    """Build the ``pallas::pair_optimization_barrier`` custom op eagerly."""
+
+    def _pair_optimization_barrier(
+        a: jax.Array, b: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        return jax.lax.optimization_barrier((a, b))
+
+    op = pallas.jax_op(
+        "pallas::pair_optimization_barrier", _pair_optimization_barrier
+    )
+    op.register_fake(lambda a, b: (torch.empty_like(a), torch.empty_like(b)))
+    return op
+
+
+def pair_optimization_barrier(
+    a: torch.Tensor, b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Order ``b``'s consumers strictly after ``a``'s producers in XLA HLO."""
+    return pair_optimization_barrier_op()(a, b)

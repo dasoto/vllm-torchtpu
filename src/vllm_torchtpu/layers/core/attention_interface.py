@@ -1298,6 +1298,193 @@ def sparse_mla_attention_dcp(
     )
 
 
+def sparse_mla_kv_update_dcp(
+    kv_c_normed: jax.Array,
+    k_pe: jax.Array,
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    mesh: Mesh,
+    nope_spec: SparseMLAKVCacheSpec,
+    rope_spec: SparseMLAKVCacheSpec,
+    *,
+    dcp_size: int,
+    interleave_size: int,
+    dcp_axis_name: str = streamindex_topk.DCP_AXIS_NAME,
+) -> tuple[jax.Array, jax.Array]:
+    """Write this step's latents into the DCP position-sharded sparse MLA cache."""
+    in_specs = (
+        P(None, None),  # kv_c_normed
+        P(None, None),  # k_pe
+        P(dcp_axis_name),  # kv_cache_nope
+        P(dcp_axis_name),  # kv_cache_rope
+        P(None),  # seq_lens
+        P(None),  # block_tables
+        P(None),  # query_start_loc
+    )
+    out_specs = (
+        P(dcp_axis_name),
+        P(dcp_axis_name),
+    )
+
+    def _local(
+        kv_c_normed_,
+        k_pe_,
+        kv_cache_nope_,
+        kv_cache_rope_,
+        seq_lens_,
+        block_tables_,
+        query_start_loc_,
+    ):
+        dcp_rank = streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size)
+        return update_sparse_mla_kv_cache_dcp(
+            kv_cache_nope_,
+            kv_cache_rope_,
+            kv_c_normed_,
+            k_pe_,
+            seq_lens_,
+            block_tables_,
+            query_start_loc_,
+            dcp_rank,
+            nope_spec=nope_spec,
+            rope_spec=rope_spec,
+            dcp_size=dcp_size,
+            interleave_size=interleave_size,
+        )
+
+    return jax.jit(
+        shard_map.shard_map(
+            _local, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False
+        )
+    )(
+        kv_c_normed,
+        k_pe,
+        kv_cache_nope,
+        kv_cache_rope,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+    )
+
+
+def sparse_mla_query_dcp(
+    ql_nope: jax.Array,
+    q_pe: jax.Array,
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    local_topk_indices: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    mesh: Mesh,
+    nope_spec: SparseMLAKVCacheSpec,
+    rope_spec: SparseMLAKVCacheSpec,
+    sm_scale: float | None = None,
+    k_scale: float | None = None,
+    *,
+    dcp_size: int,
+    dcp_axis_name: str = streamindex_topk.DCP_AXIS_NAME,
+) -> tuple[jax.Array, jax.Array]:
+    """Read-only DCP sparse MLA attention for a query token slice."""
+    num_tokens = ql_nope.shape[0]
+    if local_topk_indices.shape[0] != dcp_size * num_tokens:
+        raise ValueError(
+            "local_topk_indices must carry one row per (rank, token): "
+            f"expected {dcp_size * num_tokens} rows for {num_tokens} tokens "
+            f"at dcp_size={dcp_size}, got {local_topk_indices.shape[0]}."
+        )
+    replicated_3d = P(None, None, None)
+    in_specs = (
+        replicated_3d,  # ql_nope
+        replicated_3d,  # q_pe
+        P(dcp_axis_name),  # kv_cache_nope
+        P(dcp_axis_name),  # kv_cache_rope
+        P(dcp_axis_name, None),  # local_topk_indices
+        P(None),  # block_tables
+        P(None),  # query_start_loc
+        P(None),  # request_distribution
+    )
+    out_specs = (
+        P(dcp_axis_name, None, None),  # partial output
+        P(dcp_axis_name, None),  # partial lse
+    )
+    dequant_scale = float(k_scale) if k_scale is not None else 1.0
+    if nope_spec.layout is not rope_spec.layout:
+        raise ValueError(
+            "sparse MLA attention requires matching NoPE and RoPE layouts; "
+            f"got {nope_spec.layout.value} and {rope_spec.layout.value}"
+        )
+    cache_layout = nope_spec.layout.value
+    split_q = _resolve_sparse_mla_split_q(ql_nope, q_pe)
+
+    def _local(
+        ql_nope_,
+        q_pe_,
+        kv_cache_nope_,
+        kv_cache_rope_,
+        topk_idx,
+        block_tables_,
+        query_start_loc_,
+        request_distribution_,
+    ):
+        owns = jnp.any(topk_idx >= 0, axis=-1)
+        topk_idx = topk_idx.at[:, 0].set(
+            jnp.where(owns, topk_idx[:, 0], jnp.int32(0))
+        )
+        if split_q:
+            q, split_kwargs = ql_nope_, {"q_pe": q_pe_, "lse_lane_dense": True}
+        else:
+            q, split_kwargs = jnp.concatenate([ql_nope_, q_pe_], axis=-1), {}
+        topk_cap = envs.TPU_DCP_MLA_TOPK_CAP
+        if not (
+            topk_cap
+            and cache_layout == sparse_mla_kernel.SPARSECORE_CACHE_LAYOUT
+            and topk_idx.shape[-1] > topk_cap
+        ):
+            topk_cap = None
+        chunk_kwargs = (
+            {"gather_and_attention_chunk_size": envs.TPU_DCP_MLA_TOPK_CAP_CHUNK}
+            if topk_cap
+            else sparse_mla_chunk_kwargs()
+        )
+        local_block_tables = jnp.mod(block_tables_, jnp.int32(nope_spec.num_pages))
+        output, lse = sparse_mla_kernel.sparse_ragged_paged_attention(
+            q,
+            kv_cache_nope_,
+            kv_cache_rope_,
+            topk_idx,
+            local_block_tables,
+            query_start_loc_,
+            request_distribution_,
+            sm_scale=sm_scale or 1.0,
+            k_scale=dequant_scale,
+            return_lse=True,
+            cache_layout=cache_layout,
+            topk_cap=topk_cap,
+            **chunk_kwargs,
+            **split_kwargs,
+        )
+        lse = jnp.where(owns[:, None], lse, -jnp.inf)
+        return (output[..., : ql_nope_.shape[-1]], lse)
+
+    return jax.jit(
+        shard_map.shard_map(
+            _local, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False
+        )
+    )(
+        ql_nope,
+        q_pe,
+        kv_cache_nope,
+        kv_cache_rope,
+        local_topk_indices,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+    )
+
+
 def sparse_mla_pcp_write_split(
     kv_cache_nope: jax.Array,
     kv_cache_rope: jax.Array,

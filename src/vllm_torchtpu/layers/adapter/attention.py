@@ -2465,6 +2465,196 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             rope_cache.copy_(new_rope)
             return outputs, lse
 
+        query_chunk_env = int(
+            os.environ.get("TPU_SPARSE_MLA_DCP_QUERY_CHUNK", "0") or "0"
+        )
+        layer.sparse_mla_dcp_kv_update_op = None
+        layer.sparse_mla_dcp_query_op = None
+        layer.sparse_mla_dcp_chunk_barrier_op = None
+        if query_chunk_env > 0:
+            from jax.experimental import shard_map as _shard_map
+            from vllm_torchtpu.layers.core.attention_interface import (
+                sparse_mla_kv_update_dcp,
+                sparse_mla_query_dcp,
+            )
+
+            sharded = P(DCP_AXIS_NAME)
+            replicated = P()
+            layer_tag = layer.layer_name.replace(".", "_")
+
+            def _kv_update_core(
+                kv_cache_nope: jax.Array,
+                kv_cache_rope: jax.Array,
+                kv_c_normed: jax.Array,
+                k_pe: jax.Array,
+                seq_lens: jax.Array,
+                block_tables: jax.Array,
+                query_start_loc: jax.Array,
+            ) -> tuple[jax.Array, jax.Array]:
+                nope_spec, rope_spec = layer.mla_kv_spec
+                return sparse_mla_kv_update_dcp(
+                    kv_c_normed,
+                    k_pe,
+                    kv_cache_nope,
+                    kv_cache_rope,
+                    seq_lens,
+                    block_tables,
+                    query_start_loc,
+                    mesh,
+                    nope_spec,
+                    rope_spec,
+                    dcp_size=dcp_size,
+                    interleave_size=interleave_size,
+                )
+
+            kv_update_jax_op = pcp_streaming_jax_op(
+                f"pallas::sparse_mla_kv_update_dcp_{layer_tag}",
+                _kv_update_core,
+                donate_argnums=(0, 1),
+                mesh=mesh,
+                input_partition_specs=(
+                    sharded,
+                    sharded,
+                    replicated,
+                    replicated,
+                    replicated,
+                    replicated,
+                    replicated,
+                ),
+                output_partition_specs=(sharded, sharded),
+            )
+            kv_update_jax_op.register_fake(
+                lambda nope_c, rope_c, *rest, **kwargs: (
+                    torch.empty_like(nope_c),
+                    torch.empty_like(rope_c),
+                )
+            )
+
+            def _kv_update_impl(
+                kv_cache: tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor],
+                kv_c_normed: torch.Tensor,
+                k_pe: torch.Tensor,
+                seq_lens: torch.Tensor,
+                block_tables: torch.Tensor,
+                query_start_loc: torch.Tensor,
+            ) -> None:
+                nope_cache, rope_cache = kv_cache
+                new_nope, new_rope = kv_update_jax_op(
+                    nope_cache,
+                    rope_cache,
+                    kv_c_normed,
+                    k_pe,
+                    seq_lens,
+                    block_tables,
+                    query_start_loc,
+                )
+                nope_cache.copy_(new_nope)
+                rope_cache.copy_(new_rope)
+
+            def _query_core(
+                kv_cache_nope: jax.Array,
+                kv_cache_rope: jax.Array,
+                ql_nope: jax.Array,
+                q_pe: jax.Array,
+                local_topk_indices: jax.Array,
+                block_tables: jax.Array,
+                query_start_loc: jax.Array,
+                request_distribution: jax.Array,
+            ) -> tuple[jax.Array, jax.Array]:
+                nope_spec, rope_spec = layer.mla_kv_spec
+                return sparse_mla_query_dcp(
+                    ql_nope,
+                    q_pe,
+                    kv_cache_nope,
+                    kv_cache_rope,
+                    local_topk_indices,
+                    block_tables,
+                    query_start_loc,
+                    request_distribution,
+                    mesh,
+                    nope_spec,
+                    rope_spec,
+                    sm_scale=layer.scale,
+                    k_scale=k_scale,
+                    dcp_size=dcp_size,
+                )
+
+            query_jax_op = pcp_streaming_jax_op(
+                f"pallas::sparse_mla_query_dcp_{layer_tag}",
+                _query_core,
+                donate_argnums=None,
+                mesh=mesh,
+                input_partition_specs=(
+                    sharded,
+                    sharded,
+                    replicated,
+                    replicated,
+                    sharded,
+                    replicated,
+                    replicated,
+                    replicated,
+                ),
+                output_partition_specs=(sharded, sharded),
+            )
+            query_jax_op.register_fake(
+                lambda nope_c, rope_c, ql_n, *rest, **kwargs: (
+                    torch.empty_like(ql_n),
+                    ql_n.new_empty(ql_n.shape[:2], dtype=torch.float32),
+                )
+            )
+
+            def _query_impl(
+                kv_cache: tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor],
+                ql_nope: torch.Tensor,
+                q_pe: torch.Tensor,
+                local_topk_indices: torch.Tensor,
+                block_tables: torch.Tensor,
+                query_start_loc: torch.Tensor,
+                request_distribution: torch.Tensor,
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                nope_cache, rope_cache = kv_cache
+                return query_jax_op(
+                    nope_cache,
+                    rope_cache,
+                    ql_nope,
+                    q_pe,
+                    local_topk_indices,
+                    block_tables,
+                    query_start_loc,
+                    request_distribution,
+                )
+
+            sharded_3d = P(DCP_AXIS_NAME, None, None)
+
+            def _barrier_core(
+                prev_out: jax.Array, next_q: jax.Array
+            ) -> tuple[jax.Array, jax.Array]:
+                return jax.jit(
+                    _shard_map.shard_map(
+                        lambda a, b: jax.lax.optimization_barrier((a, b)),
+                        mesh=mesh,
+                        in_specs=(sharded_3d, sharded_3d),
+                        out_specs=(sharded_3d, sharded_3d),
+                        check_rep=False,
+                    )
+                )(prev_out, next_q)
+
+            barrier_jax_op = pcp_streaming_jax_op(
+                f"pallas::sparse_mla_chunk_barrier_{layer_tag}",
+                _barrier_core,
+                donate_argnums=None,
+                mesh=mesh,
+                input_partition_specs=(sharded, sharded),
+                output_partition_specs=(sharded, sharded),
+            )
+            barrier_jax_op.register_fake(
+                lambda a, b: (torch.empty_like(a), torch.empty_like(b))
+            )
+
+            layer.sparse_mla_dcp_kv_update_op = _kv_update_impl
+            layer.sparse_mla_dcp_query_op = _query_impl
+            layer.sparse_mla_dcp_chunk_barrier_op = barrier_jax_op
+
         return sparse_mla_dcp_impl
 
     def _build_pcp_write_split_op(self, layer: Any):
@@ -2824,64 +3014,140 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     os.environ.get("TPU_SPARSE_MLA_DCP_FUSED_Q_MAX_TOKENS", "0")
                     or "0"
                 )
+                query_chunk = int(
+                    os.environ.get("TPU_SPARSE_MLA_DCP_QUERY_CHUNK", "0") or "0"
+                )
                 is_backbone_graph = (
                     vllm_compilation_backends.model_tag == "backbone"
                 )
-                if use_qrep:
-                    ql_nope_dcp, q_pe_dcp = ql_nope_flat, q_pe_flat
-                elif (
-                    envs.TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER
-                    and (
-                        fused_q_max_tokens <= 0
-                        or not is_backbone_graph
-                        or ql_nope_flat.shape[0] <= fused_q_max_tokens
-                    )
-                    and ql_nope_flat.dtype == q_pe_flat.dtype
-                    and all_gather_heads is _cp_mla_attention.all_gather_heads
+                if (
+                    query_chunk > 0
+                    and is_backbone_graph
+                    and not use_qrep
+                    and getattr(layer, "sparse_mla_dcp_query_op", None) is not None
+                    and ql_nope_flat.shape[0] > query_chunk
+                    and (ql_nope_flat.shape[0] % 256 == 0)
                 ):
-                    ql_nope_dcp, q_pe_dcp = all_gather_q_nope_pe_heads(
-                        ql_nope_flat,
-                        q_pe_flat,
-                        layer.kv_lora_rank,
+                    num_tokens = int(ql_nope_flat.shape[0])
+                    layer.sparse_mla_dcp_kv_update_op(
+                        kv_cache,
+                        kv_c_normed_flat,
+                        k_pe_flat,
+                        attn_metadata.seq_lens,
+                        attn_metadata.block_tables,
+                        attn_metadata.query_start_loc,
+                    )
+                    chunk_outs: list[torch.Tensor] = []
+                    barrier_op = layer.sparse_mla_dcp_chunk_barrier_op
+                    use_fused_q = (
+                        envs.TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER
+                        and ql_nope_flat.dtype == q_pe_flat.dtype
+                        and all_gather_heads is _cp_mla_attention.all_gather_heads
+                    )
+                    for s in range(0, num_tokens, query_chunk):
+                        e = min(s + query_chunk, num_tokens)
+                        ql_c = ql_nope_flat[s:e].contiguous()
+                        qp_c = q_pe_flat[s:e].contiguous()
+                        if chunk_outs and barrier_op is not None:
+                            chunk_outs[-1], ql_c = barrier_op(chunk_outs[-1], ql_c)
+                        if (
+                            use_fused_q
+                            and (fused_q_max_tokens <= 0 or (e - s) <= fused_q_max_tokens)
+                        ):
+                            ql_nope_dcp, q_pe_dcp = all_gather_q_nope_pe_heads(
+                                ql_c,
+                                qp_c,
+                                layer.kv_lora_rank,
+                                spans_pcp=self.pcp_kv_gather,
+                            )
+                        else:
+                            ql_nope_dcp = all_gather_heads(
+                                ql_c, spans_pcp=self.pcp_kv_gather
+                            )
+                            q_pe_dcp = all_gather_heads(
+                                qp_c, spans_pcp=self.pcp_kv_gather
+                            )
+                        slice_qsl = torch.clamp(
+                            attn_metadata.query_start_loc - s,
+                            min=0,
+                            max=e - s,
+                        )
+                        partial_c, lse_c = layer.sparse_mla_dcp_query_op(
+                            kv_cache,
+                            ql_nope_dcp,
+                            q_pe_dcp,
+                            topk_indices[s:e].contiguous(),
+                            attn_metadata.block_tables,
+                            slice_qsl,
+                            attn_metadata.request_distribution,
+                        )
+                        chunk_outs.append(
+                            merge_lse_partials_scatter_heads(
+                                partial_c,
+                                lse_c,
+                                is_backbone=True,
+                                spans_pcp=self.pcp_kv_gather,
+                            )
+                        )
+                    outputs = torch.cat(chunk_outs, dim=0)
+                else:
+                    if use_qrep:
+                        ql_nope_dcp, q_pe_dcp = ql_nope_flat, q_pe_flat
+                    elif (
+                        envs.TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER
+                        and (
+                            fused_q_max_tokens <= 0
+                            or not is_backbone_graph
+                            or ql_nope_flat.shape[0] <= fused_q_max_tokens
+                        )
+                        and ql_nope_flat.dtype == q_pe_flat.dtype
+                        and all_gather_heads is _cp_mla_attention.all_gather_heads
+                    ):
+                        ql_nope_dcp, q_pe_dcp = all_gather_q_nope_pe_heads(
+                            ql_nope_flat,
+                            q_pe_flat,
+                            layer.kv_lora_rank,
+                            spans_pcp=self.pcp_kv_gather,
+                        )
+                    else:
+                        ql_nope_dcp = all_gather_heads(
+                            ql_nope_flat, spans_pcp=self.pcp_kv_gather
+                        )
+                        q_pe_dcp = all_gather_heads(
+                            q_pe_flat, spans_pcp=self.pcp_kv_gather
+                        )
+                    # `topk_indices` here is not global positions: the DCP indexer
+                    # already resolved each token's global top-k into this rank's
+                    # own local cache indices, `-1` where it owns nothing.
+                    partial, lse = layer.sparse_mla_dcp_op(
+                        kv_cache,
+                        ql_nope_dcp,
+                        q_pe_dcp,
+                        kv_c_normed_flat,
+                        k_pe_flat,
+                        topk_indices,
+                        attn_metadata.seq_lens,
+                        attn_metadata.block_tables,
+                        attn_metadata.query_start_loc,
+                        attn_metadata.request_distribution,
+                    )
+                    # The scatter undoes the head all-gather above.
+                    #
+                    # Only the backbone may use the all-to-all merge. The merge
+                    # picks it by comparing the token count to
+                    # TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS at trace time, and only
+                    # the backbone is traced multiple times, once per bucket
+                    # group (`_precompile_backbone`). The MTP drafter (model_tag
+                    # "eagle_head") is traced once for every bucket: the
+                    # comparison would pin its graph to the first size, and the
+                    # large buckets fail with ShapeSpecializationError. So the
+                    # drafter keeps the reduce-scatter, as with the flag off.
+                    outputs = merge_lse_partials_scatter_heads(
+                        partial,
+                        lse,
+                        is_backbone=vllm_compilation_backends.model_tag == "backbone",
                         spans_pcp=self.pcp_kv_gather,
                     )
-                else:
-                    ql_nope_dcp = all_gather_heads(
-                        ql_nope_flat, spans_pcp=self.pcp_kv_gather
-                    )
-                    q_pe_dcp = all_gather_heads(q_pe_flat, spans_pcp=self.pcp_kv_gather)
-                # `topk_indices` here is not global positions: the DCP indexer
-                # already resolved each token's global top-k into this rank's
-                # own local cache indices, `-1` where it owns nothing.
-                partial, lse = layer.sparse_mla_dcp_op(
-                    kv_cache,
-                    ql_nope_dcp,
-                    q_pe_dcp,
-                    kv_c_normed_flat,
-                    k_pe_flat,
-                    topk_indices,
-                    attn_metadata.seq_lens,
-                    attn_metadata.block_tables,
-                    attn_metadata.query_start_loc,
-                    attn_metadata.request_distribution,
-                )
-                # The scatter undoes the head all-gather above.
-                #
-                # Only the backbone may use the all-to-all merge. The merge
-                # picks it by comparing the token count to
-                # TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS at trace time, and only
-                # the backbone is traced multiple times, once per bucket
-                # group (`_precompile_backbone`). The MTP drafter (model_tag
-                # "eagle_head") is traced once for every bucket: the
-                # comparison would pin its graph to the first size, and the
-                # large buckets fail with ShapeSpecializationError. So the
-                # drafter keeps the reduce-scatter, as with the flag off.
-                outputs = merge_lse_partials_scatter_heads(
-                    partial,
-                    lse,
-                    is_backbone=vllm_compilation_backends.model_tag == "backbone",
-                    spans_pcp=self.pcp_kv_gather,
-                )
             else:
                 if not hasattr(layer, "sparse_mla_op") or layer.sparse_mla_op is None:
                     layer.sparse_mla_op = self._build_sparse_mla_op(layer)
